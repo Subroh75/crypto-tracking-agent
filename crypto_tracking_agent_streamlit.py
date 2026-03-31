@@ -227,8 +227,6 @@ def enrich_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_consensus_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
     buys = df[df["action"] == "BUY"].copy()
     if buys.empty:
         return pd.DataFrame()
@@ -257,10 +255,7 @@ st.caption(APP_SUBTITLE)
 
 with st.sidebar:
     st.header("Configuration")
-    st.markdown(
-        "Enter wallets as one per line: `label,address,chain`  \n"
-        "Example: `alpha,0x1234...,base`"
-    )
+    st.markdown("Enter wallets as one per line: `label,address,chain`  \nExample: `alpha,0x1234...,base`")
     wallets_text = st.text_area(
         "Tracked wallets",
         value="",
@@ -277,14 +272,12 @@ with st.sidebar:
     refresh = st.button("Refresh")
 
 wallets = parse_wallets(wallets_text)
-
 if refresh:
     st.cache_data.clear()
 
 if not wallets:
     st.info("Add at least one real wallet in the sidebar to begin.")
     st.stop()
-
 if not moralis_api_key:
     st.warning("Add a Moralis API key to load live wallet data.")
     st.stop()
@@ -296,71 +289,36 @@ all_rows: List[Dict[str, Any]] = []
 with st.spinner("Fetching wallet activity..."):
     for wallet in wallets:
         stats = get_wallet_stats(wallet["address"], wallet["chain"], moralis_api_key)
-        stats_rows.append(
-            {
-                "wallet_label": wallet["label"],
-                "chain": wallet["chain"],
-                "address": wallet["address"],
-                "token_transfers_total": safe_get(stats, "token_transfers", "total", default=0),
-                "transactions_total": safe_get(stats, "transactions", "total", default=0),
-                "stats_error": stats.get("error", "") if isinstance(stats, dict) else "",
-            }
-        )
+        stats_rows.append({
+            "wallet_label": wallet["label"],
+            "chain": wallet["chain"],
+            "address": wallet["address"],
+            "token_transfers_total": safe_get(stats, "token_transfers", "total", default=0),
+            "transactions_total": safe_get(stats, "transactions", "total", default=0),
+            "stats_error": stats.get("error", "") if isinstance(stats, dict) else "",
+        })
         try:
-            swaps = get_wallet_swaps(
-                address=wallet["address"],
-                chain=wallet["chain"],
-                api_key=moralis_api_key,
-                hours_back=hours_back,
-                limit=limit,
-            )
+            swaps = get_wallet_swaps(wallet["address"], wallet["chain"], moralis_api_key, hours_back, limit)
             for item in swaps:
                 all_rows.append(normalize_swap(item, wallet))
         except Exception as exc:
             errors.append(f"{wallet['label']} ({wallet['chain']}): {exc}")
 
 stats_df = pd.DataFrame(stats_rows)
-signals_df = pd.DataFrame(all_rows)
+raw_signals_df = pd.DataFrame(all_rows)
 
 st.subheader("Wallet diagnostics")
 if not stats_df.empty:
-    st.dataframe(
-    display[[
-        "timestamp",
-        "wallet_label",
-        "chain",
-        "action",
-        "token_symbol",
-        "token_name",
-        "amount",
-        "sold_symbol",
-        "sold_amount",
-        "bought_symbol",
-        "bought_amount",
-        "exchangeName",
-        "priceUsd",
-        "liquidityUsd",
-        "volume24h",
-        "priceChangeH24",
-        "pairUrl",
-        "tx_hash",
-    ]],
-    use_container_width=True,
-    hide_index=True,
-)
-
+    st.dataframe(stats_df, use_container_width=True, hide_index=True)
 if errors:
     with st.expander("API errors", expanded=True):
         for err in errors:
             st.error(err)
-
-if signals_df.empty:
-    st.warning(
-        "Moralis returned no swaps for these wallets in the current lookback window. "
-        "That usually means the wallet list is poor for swap tracking, not that the app is broken."
-    )
+if raw_signals_df.empty:
+    st.warning("Moralis returned no swaps for these wallets in the current lookback window.")
     st.stop()
 
+signals_df = raw_signals_df.copy()
 signals_df["timestamp"] = pd.to_datetime(signals_df["timestamp"], errors="coerce", utc=True)
 signals_df = signals_df.sort_values("timestamp", ascending=False)
 
@@ -392,9 +350,7 @@ else:
     display_consensus = consensus_df.copy()
     for col in ["price_usd", "liquidity_usd", "volume_24h"]:
         display_consensus[col] = display_consensus[col].apply(fmt_num)
-    display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(
-        lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%"
-    )
+    display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%")
     st.dataframe(
         display_consensus[[
             "chain",
