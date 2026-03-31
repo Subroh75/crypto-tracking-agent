@@ -158,12 +158,43 @@ def get_wallet_token_transfers(address: str, chain: str, api_key: str, offset: i
     message = str(data.get("message", ""))
     result = data.get("result", [])
     if isinstance(result, str):
-        if result:
+        if result and result not in {"No transactions found", "No records found"}:
             return {"error": result[:180], "raw": data}
         return {"result": []}
     if status == "0" and message not in {"No transactions found", "No records found"} and result:
         return {"error": str(result)[:180], "raw": data}
     return {"result": result or []}
+
+
+@st.cache_data(ttl=180)
+def get_token_market_snapshot(chain: str, token_address: str) -> Dict[str, Any]:
+    if not token_address:
+        return {}
+    ds_chain = DEXSCREENER_CHAIN_MAP.get(chain, chain)
+    url = f"https://api.dexscreener.com/token-pairs/v1/{ds_chain}/{token_address}"
+    try:
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    except Exception:
+        return {}
+    if resp.status_code != 200:
+        return {}
+    pairs = resp.json() or []
+    if not isinstance(pairs, list) or not pairs:
+        return {}
+
+    def rank_pair(pair: Dict[str, Any]) -> Tuple[float, float]:
+        liquidity = safe_float((pair.get("liquidity") or {}).get("usd") if isinstance(pair.get("liquidity"), dict) else 0)
+        volume = safe_float((pair.get("volume") or {}).get("h24") if isinstance(pair.get("volume"), dict) else 0)
+        return liquidity, volume
+
+    best = sorted(pairs, key=rank_pair, reverse=True)[0]
+    return {
+        "priceUsd": best.get("priceUsd"),
+        "liquidityUsd": (best.get("liquidity") or {}).get("usd") if isinstance(best.get("liquidity"), dict) else None,
+        "volume24h": (best.get("volume") or {}).get("h24") if isinstance(best.get("volume"), dict) else None,
+        "priceChangeH24": (best.get("priceChange") or {}).get("h24") if isinstance(best.get("priceChange"), dict) else None,
+        "pairUrl": best.get("url"),
+    }
 
 
 def normalize_transfer(item: Dict[str, Any], wallet_meta: Dict[str, str], lookback_hours: int) -> Dict[str, Any] | None:
@@ -198,6 +229,13 @@ def normalize_transfer(item: Dict[str, Any], wallet_meta: Dict[str, str], lookba
     else:
         action = "MOVE"
 
+    if action == "MOVE":
+        return None
+    if symbol in STABLE_SYMBOLS:
+        return None
+    if amount <= 0:
+        return None
+
     return {
         "timestamp": ts,
         "wallet_label": wallet_meta["label"],
@@ -211,37 +249,6 @@ def normalize_transfer(item: Dict[str, Any], wallet_meta: Dict[str, str], lookba
         "from_address": from_addr,
         "to_address": to_addr,
         "tx_hash": str(item.get("hash") or ""),
-    }
-
-
-@st.cache_data(ttl=180)
-def get_token_market_snapshot(chain: str, token_address: str) -> Dict[str, Any]:
-    if not token_address:
-        return {}
-    ds_chain = DEXSCREENER_CHAIN_MAP.get(chain, chain)
-    url = f"https://api.dexscreener.com/token-pairs/v1/{ds_chain}/{token_address}"
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-    except Exception:
-        return {}
-    if resp.status_code != 200:
-        return {}
-    pairs = resp.json() or []
-    if not isinstance(pairs, list) or not pairs:
-        return {}
-
-    def rank_pair(pair: Dict[str, Any]) -> Tuple[float, float]:
-        liquidity = safe_float(pair.get("liquidity", {}).get("usd") if isinstance(pair.get("liquidity"), dict) else 0)
-        volume = safe_float(pair.get("volume", {}).get("h24") if isinstance(pair.get("volume"), dict) else 0)
-        return liquidity, volume
-
-    best = sorted(pairs, key=rank_pair, reverse=True)[0]
-    return {
-        "priceUsd": best.get("priceUsd"),
-        "liquidityUsd": (best.get("liquidity") or {}).get("usd") if isinstance(best.get("liquidity"), dict) else None,
-        "volume24h": (best.get("volume") or {}).get("h24") if isinstance(best.get("volume"), dict) else None,
-        "priceChangeH24": (best.get("priceChange") or {}).get("h24") if isinstance(best.get("priceChange"), dict) else None,
-        "pairUrl": best.get("url"),
     }
 
 
@@ -276,26 +283,50 @@ def build_wallet_profiles(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for wallet_label, wallet_df in df.groupby("wallet_label"):
+        buy_events = int((wallet_df["action"] == "BUY").sum())
+        sell_events = int((wallet_df["action"] == "SELL").sum())
+        unique_tokens = int(wallet_df["token_symbol"].nunique())
+        events = len(wallet_df)
+        wallet_score = 0
+        if buy_events > sell_events:
+            wallet_score += 20
+        if unique_tokens <= 5:
+            wallet_score += 20
+        if events >= 10:
+            wallet_score += 20
+        if buy_events >= 5:
+            wallet_score += 15
+        if sell_events > buy_events * 1.5:
+            wallet_score -= 15
+        wallet_score = max(0, min(wallet_score, 100))
+
         rows.append(
             {
                 "wallet_label": wallet_label,
                 "chain": wallet_df["chain"].iloc[0],
-                "events": len(wallet_df),
-                "unique_tokens": wallet_df["token_symbol"].nunique(),
-                "buy_events": int((wallet_df["action"] == "BUY").sum()),
-                "sell_events": int((wallet_df["action"] == "SELL").sum()),
+                "events": events,
+                "unique_tokens": unique_tokens,
+                "buy_events": buy_events,
+                "sell_events": sell_events,
                 "largest_buy_amount": pd.to_numeric(wallet_df.loc[wallet_df["action"] == "BUY", "amount"], errors="coerce").max(),
                 "style": classify_wallet_style(wallet_df),
+                "wallet_score": wallet_score,
                 "last_seen": wallet_df["timestamp"].max(),
             }
         )
-    return pd.DataFrame(rows).sort_values(["events", "buy_events"], ascending=False)
+    return pd.DataFrame(rows).sort_values(["wallet_score", "events", "buy_events"], ascending=False)
 
 
-def score_signal(wallet_count: int, buy_events: int, liquidity: float, volume_24h: float, price_change_h24: float) -> Tuple[int, str]:
+def score_signal(wallet_count: int, buy_events: int, liquidity: float, volume_24h: float, price_change_h24: float, recency_hours: float, wallet_score_sum: float) -> Tuple[int, str]:
     score = 0
-    score += min(wallet_count * 20, 40)
+    score += min(int(wallet_score_sum / 2), 40)
     score += min(buy_events * 4, 20)
+
+    if wallet_count >= 2:
+        score += 10
+    elif wallet_count == 1:
+        score -= 8
+
     if liquidity > 250_000:
         score += 20
     elif liquidity > 100_000:
@@ -304,22 +335,36 @@ def score_signal(wallet_count: int, buy_events: int, liquidity: float, volume_24
         score += 8
     else:
         score -= 18
+
     if volume_24h > 250_000:
         score += 15
     elif volume_24h > 100_000:
         score += 10
-    elif volume_24h > 25_000:
-        score += 5
+    elif volume_24h > 50_000:
+        score += 6
+    elif volume_24h > 20_000:
+        score += 3
     else:
         score -= 12
-    if price_change_h24 > 25:
+
+    if 5 <= price_change_h24 <= 20:
+        score += 10
+    elif price_change_h24 > 25:
         score -= 15
     elif price_change_h24 > 10:
-        score -= 8
+        score -= 4
     elif -5 <= price_change_h24 <= 10:
         score += 6
     elif price_change_h24 < -15:
         score -= 6
+
+    if recency_hours <= 1:
+        score += 15
+    elif recency_hours <= 6:
+        score += 8
+    elif recency_hours <= 24:
+        score += 3
+
     score = max(0, min(int(score), 100))
     if score >= 75:
         return score, "High Conviction"
@@ -364,16 +409,19 @@ def classify_risk(liquidity: float, wallet_count: int) -> str:
     return "High"
 
 
-def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd.DataFrame:
+def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame, min_liquidity: float, min_volume: float, min_buy_events: int) -> pd.DataFrame:
     buys = df[df["action"] == "BUY"].copy()
-    buys = buys[~buys["token_symbol"].isin(STABLE_SYMBOLS)]
     if buys.empty:
         return pd.DataFrame()
+
     style_lookup = dict(zip(wallet_profiles["wallet_label"], wallet_profiles["style"])) if not wallet_profiles.empty else {}
+    score_lookup = dict(zip(wallet_profiles["wallet_label"], wallet_profiles["wallet_score"])) if not wallet_profiles.empty else {}
+
     grouped = (
         buys.groupby(["chain", "token_symbol", "token_name", "token_address"], dropna=False)
         .agg(
             wallets=("wallet_label", lambda s: ", ".join(sorted(set(s)))),
+            wallet_list=("wallet_label", lambda s: sorted(set(s))),
             wallet_count=("wallet_label", lambda s: len(set(s))),
             buy_events=("tx_hash", "count"),
             last_seen=("timestamp", "max"),
@@ -385,13 +433,46 @@ def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd
         )
         .reset_index()
     )
-    grouped["wallet_styles"] = grouped["wallets"].apply(lambda text: ", ".join(sorted({style_lookup.get(w.strip(), "unknown") for w in text.split(",") if w.strip()})))
-    grouped["signal_score"] = grouped.apply(lambda r: score_signal(int(r["wallet_count"]), int(r["buy_events"]), safe_float(r["liquidity_usd"]), safe_float(r["volume_24h"]), safe_float(r["price_change_h24"]))[0], axis=1)
-    grouped["signal_label"] = grouped.apply(lambda r: score_signal(int(r["wallet_count"]), int(r["buy_events"]), safe_float(r["liquidity_usd"]), safe_float(r["volume_24h"]), safe_float(r["price_change_h24"]))[1], axis=1)
+
+    grouped["wallet_styles"] = grouped["wallet_list"].apply(lambda wallet_list: ", ".join(sorted({style_lookup.get(w, "unknown") for w in wallet_list})))
+    grouped["wallet_score_sum"] = grouped["wallet_list"].apply(lambda wallet_list: sum(score_lookup.get(w, 0) for w in wallet_list))
+    grouped["recency_hours"] = grouped["last_seen"].apply(lambda ts: max(0.0, (now_utc() - ts).total_seconds() / 3600) if pd.notna(ts) else 999.0)
+
+    grouped = grouped[grouped["buy_events"] >= min_buy_events]
+    grouped = grouped[grouped["liquidity_usd"].fillna(0).apply(safe_float) >= min_liquidity]
+    grouped = grouped[grouped["volume_24h"].fillna(0).apply(safe_float) >= min_volume]
+
+    if grouped.empty:
+        return grouped
+
+    grouped["signal_score"] = grouped.apply(
+        lambda r: score_signal(
+            int(r["wallet_count"]),
+            int(r["buy_events"]),
+            safe_float(r["liquidity_usd"]),
+            safe_float(r["volume_24h"]),
+            safe_float(r["price_change_h24"]),
+            safe_float(r["recency_hours"], 999.0),
+            safe_float(r["wallet_score_sum"]),
+        )[0],
+        axis=1,
+    )
+    grouped["signal_label"] = grouped.apply(
+        lambda r: score_signal(
+            int(r["wallet_count"]),
+            int(r["buy_events"]),
+            safe_float(r["liquidity_usd"]),
+            safe_float(r["volume_24h"]),
+            safe_float(r["price_change_h24"]),
+            safe_float(r["recency_hours"], 999.0),
+            safe_float(r["wallet_score_sum"]),
+        )[1],
+        axis=1,
+    )
     grouped["setup_type"] = grouped.apply(lambda r: classify_setup(safe_float(r["price_change_h24"]), int(r["wallet_count"]), int(r["buy_events"])), axis=1)
     grouped["entry_signal"] = grouped["setup_type"].apply(classify_entry_signal)
     grouped["risk_level"] = grouped.apply(lambda r: classify_risk(safe_float(r["liquidity_usd"]), int(r["wallet_count"])), axis=1)
-    return grouped.sort_values(["signal_score", "wallet_count", "buy_events"], ascending=False)
+    return grouped.sort_values(["signal_score", "wallet_score_sum", "wallet_count", "buy_events"], ascending=False)
 
 
 def build_social_panel(social_df: pd.DataFrame) -> pd.DataFrame:
@@ -417,6 +498,7 @@ def build_fusion_panel(consensus_df: pd.DataFrame, social_df: pd.DataFrame) -> p
         out["buy_events"] = 0
         out["wallets"] = ""
         out["wallet_styles"] = ""
+        out["wallet_score_sum"] = 0
         out["liquidity_usd"] = None
         out["volume_24h"] = None
         out["price_change_h24"] = None
@@ -437,7 +519,7 @@ def build_fusion_panel(consensus_df: pd.DataFrame, social_df: pd.DataFrame) -> p
         out["fusion_label"] = out["fusion_score"].apply(lambda s: "Whales only" if s >= 20 else "Ignore")
         return out
     merged = consensus_df.merge(social_df, on="token_symbol", how="outer")
-    for col in ["signal_score", "social_score", "wallet_count", "buy_events", "mentions", "influencers"]:
+    for col in ["signal_score", "social_score", "wallet_count", "buy_events", "mentions", "influencers", "wallet_score_sum"]:
         merged[col] = merged[col].fillna(0)
     for col in ["wallets", "wallet_styles", "note", "setup_type", "entry_signal", "risk_level"]:
         if col in merged.columns:
@@ -492,9 +574,14 @@ with st.sidebar:
     etherscan_api_key = st.text_input("Etherscan API key", value=default_etherscan_key, type="password")
     hours_back = st.slider("Lookback window (hours)", 6, 168, 48, 6)
     limit = st.slider("Max transfers per wallet", 20, 300, 100, 20)
-    min_wallet_consensus = st.slider("Minimum wallets buying same token", 1, 5, 1, 1)
-    hide_majors = st.checkbox("Hide majors / stablecoins", value=False)
+    min_wallet_consensus = st.slider("Minimum wallets buying same token", 1, 5, 2, 1)
+    hide_majors = st.checkbox("Hide majors / majors", value=False)
     only_buys = st.checkbox("Only show BUY signals", value=False)
+
+    st.markdown("### Quality filters")
+    min_liquidity = st.number_input("Min liquidity USD", min_value=0, value=100000, step=10000)
+    min_volume = st.number_input("Min 24h volume USD", min_value=0, value=50000, step=10000)
+    min_buy_events = st.number_input("Min buy events", min_value=1, value=2, step=1)
 
     st.markdown("### Social watchlist")
     social_watchlist_text = st.text_area(
@@ -529,29 +616,25 @@ with st.spinner("Fetching wallet activity..."):
         if payload.get("error"):
             msg = str(payload.get("error"))
             errors.append(f"{wallet['label']} ({wallet['chain']}): {msg}")
-            if "rate limit" in msg.lower() or "max rate" in msg.lower() or "NOTOK" in msg:
+            if "rate limit" in msg.lower() or "max calls" in msg.lower():
                 quota_hit = True
-            stats_rows.append(
-                {
-                    "wallet_label": wallet["label"],
-                    "chain": wallet["chain"],
-                    "address": wallet["address"],
-                    "transfers_fetched": 0,
-                    "status": "error",
-                }
-            )
-            continue
-
-        transfers = payload.get("result", [])
-        stats_rows.append(
-            {
+            stats_rows.append({
                 "wallet_label": wallet["label"],
                 "chain": wallet["chain"],
                 "address": wallet["address"],
-                "transfers_fetched": len(transfers),
-                "status": "ok",
-            }
-        )
+                "transfers_fetched": 0,
+                "status": "error",
+            })
+            continue
+
+        transfers = payload.get("result", [])
+        stats_rows.append({
+            "wallet_label": wallet["label"],
+            "chain": wallet["chain"],
+            "address": wallet["address"],
+            "transfers_fetched": len(transfers),
+            "status": "ok",
+        })
         for item in transfers:
             normalized = normalize_transfer(item, wallet, hours_back)
             if normalized is not None:
@@ -568,7 +651,7 @@ if errors:
     for err in errors:
         st.error(err)
 if quota_hit and raw_df.empty:
-    st.warning("The provider appears rate-limited or quota-limited right now. Try again later or reduce refresh frequency.")
+    st.warning("The provider appears rate-limited right now. Try again later or reduce refresh frequency.")
     st.stop()
 if raw_df.empty:
     st.warning("No token transfer activity was returned for the current wallets and time window.")
@@ -588,7 +671,7 @@ if signals_df.empty:
     st.stop()
 
 wallet_profiles_df = build_wallet_profiles(signals_df)
-consensus_df = build_consensus_table(signals_df, wallet_profiles_df)
+consensus_df = build_consensus_table(signals_df, wallet_profiles_df, float(min_liquidity), float(min_volume), int(min_buy_events))
 if not consensus_df.empty:
     consensus_df = consensus_df[consensus_df["wallet_count"] >= min_wallet_consensus]
 fusion_df = build_fusion_panel(consensus_df, social_df)
@@ -611,16 +694,19 @@ left_col, right_col = st.columns(2)
 with left_col:
     st.subheader("On-chain signals")
     if consensus_df.empty:
-        st.info("No consensus tokens found yet.")
+        st.info("No consensus tokens found after quality filters.")
     else:
         display_consensus = consensus_df.copy()
-        for col in ["price_usd", "liquidity_usd", "volume_24h"]:
-            display_consensus[col] = display_consensus[col].apply(fmt_num)
+        for col in ["price_usd", "liquidity_usd", "volume_24h", "wallet_score_sum"]:
+            if col in display_consensus.columns:
+                display_consensus[col] = display_consensus[col].apply(fmt_num)
         display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{safe_float(x):.2f}%")
+        display_consensus["recency_hours"] = display_consensus["recency_hours"].apply(lambda x: f"{safe_float(x):.1f}")
         st.dataframe(display_consensus[[
             "signal_score", "signal_label", "setup_type", "entry_signal", "risk_level", "chain",
-            "token_symbol", "token_name", "wallet_count", "buy_events", "wallets", "wallet_styles",
-            "price_usd", "liquidity_usd", "volume_24h", "price_change_h24", "last_seen", "pair_url"
+            "token_symbol", "token_name", "wallet_count", "buy_events", "wallet_score_sum", "recency_hours",
+            "wallets", "wallet_styles", "price_usd", "liquidity_usd", "volume_24h", "price_change_h24",
+            "last_seen", "pair_url"
         ]], use_container_width=True, hide_index=True)
 
 with right_col:
@@ -637,16 +723,18 @@ if fusion_df.empty:
     st.info("No fusion signals yet.")
 else:
     fusion_display = fusion_df.copy()
-    for col in ["liquidity_usd", "volume_24h"]:
+    for col in ["liquidity_usd", "volume_24h", "wallet_score_sum"]:
         if col in fusion_display.columns:
             fusion_display[col] = fusion_display[col].apply(fmt_num)
     if "price_change_h24" in fusion_display.columns:
         fusion_display["price_change_h24"] = fusion_display["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{safe_float(x):.2f}%")
+    if "recency_hours" in fusion_display.columns:
+        fusion_display["recency_hours"] = fusion_display["recency_hours"].apply(lambda x: f"{safe_float(x):.1f}")
     show_cols = [c for c in [
         "fusion_score", "fusion_label", "token_symbol", "chain", "signal_score", "social_score",
-        "setup_type", "entry_signal", "risk_level", "wallet_count", "buy_events", "mentions",
-        "influencers", "sentiment", "wallets", "wallet_styles", "liquidity_usd", "volume_24h",
-        "price_change_h24", "note", "pair_url"
+        "setup_type", "entry_signal", "risk_level", "wallet_count", "buy_events", "wallet_score_sum",
+        "recency_hours", "mentions", "influencers", "sentiment", "wallets", "wallet_styles",
+        "liquidity_usd", "volume_24h", "price_change_h24", "note", "pair_url"
     ] if c in fusion_display.columns]
     st.dataframe(fusion_display[show_cols], use_container_width=True, hide_index=True)
 
@@ -657,6 +745,7 @@ else:
         f"{selected_row.get('token_symbol', 'Unknown')} is classified as {selected_row.get('fusion_label', 'Watch')} with fusion score {int(selected_row.get('fusion_score', 0) or 0)}. "
         f"Setup: {selected_row.get('setup_type', 'Unknown')}. Entry: {selected_row.get('entry_signal', 'Monitor only')}. Risk: {selected_row.get('risk_level', 'Unknown')}. "
         f"On-chain score {int(selected_row.get('signal_score', 0) or 0)}, social score {int(selected_row.get('social_score', 0) or 0)}. "
+        f"Wallet score sum: {fmt_num(selected_row.get('wallet_score_sum', 0))}. Recency: {safe_float(selected_row.get('recency_hours', 0)):.1f}h. "
         f"Wallets: {selected_row.get('wallets', '') or 'none'}. Social note: {selected_row.get('note', '') or 'none'}."
     )
 
@@ -676,13 +765,16 @@ st.dataframe(display[[
 with st.expander("Notes"):
     st.markdown(
         """
-This version implements the new architecture:
-- Etherscan V2 for wallet token transfers
-- DEX Screener for market enrichment
-- manual social watchlist input
-- fusion scoring
-- entry intelligence
+This version adds sharper signal quality logic:
+- quality filters for liquidity, volume, and buy count
+- wallet scoring
+- recency boost
+- improved setup and entry classification
 
-Use an `ETHERSCAN_API_KEY` secret in Streamlit for the cleanest setup.
+Recommended defaults:
+- min wallets: 2
+- min liquidity: 100,000
+- min volume: 50,000
+- min buy events: 2
         """
     )
