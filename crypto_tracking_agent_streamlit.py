@@ -396,22 +396,20 @@ else:
         lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%"
     )
     st.dataframe(
-        display_consensus[
-            [
-                "chain",
-                "token_symbol",
-                "token_name",
-                "wallet_count",
-                "buy_events",
-                "wallets",
-                "price_usd",
-                "liquidity_usd",
-                "volume_24h",
-                "price_change_h24",
-                "last_seen",
-                "pair_url",
-            ]
-        ],
+        display_consensus[[
+            "chain",
+            "token_symbol",
+            "token_name",
+            "wallet_count",
+            "buy_events",
+            "wallets",
+            "price_usd",
+            "liquidity_usd",
+            "volume_24h",
+            "price_change_h24",
+            "last_seen",
+            "pair_url",
+        ]],
         use_container_width=True,
         hide_index=True,
     )
@@ -426,28 +424,26 @@ for col in ["priceChangeM5", "priceChangeH1", "priceChangeH6", "priceChangeH24"]
         display[col] = display[col].apply(lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%")
 
 st.dataframe(
-    display[
-        [
-            "timestamp",
-            "wallet_label",
-            "chain",
-            "action",
-            "token_symbol",
-            "token_name",
-            "amount",
-            "sold_symbol",
-            "sold_amount",
-            "bought_symbol",
-            "bought_amount",
-            "exchangeName",
-            "priceUsd",
-            "liquidityUsd",
-            "volume24h",
-            "priceChangeH24",
-            "pairUrl",
-            "tx_hash",
-        ]
-    ],
+    display[[
+        "timestamp",
+        "wallet_label",
+        "chain",
+        "action",
+        "token_symbol",
+        "token_name",
+        "amount",
+        "sold_symbol",
+        "sold_amount",
+        "bought_symbol",
+        "bought_amount",
+        "exchangeName",
+        "priceUsd",
+        "liquidityUsd",
+        "volume24h",
+        "priceChangeH24",
+        "pairUrl",
+        "tx_hash",
+    ]],
     use_container_width=True,
     hide_index=True,
 )
