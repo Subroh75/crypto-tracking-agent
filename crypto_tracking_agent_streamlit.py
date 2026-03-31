@@ -324,7 +324,30 @@ signals_df = pd.DataFrame(all_rows)
 
 st.subheader("Wallet diagnostics")
 if not stats_df.empty:
-    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    st.dataframe(
+    display[[
+        "timestamp",
+        "wallet_label",
+        "chain",
+        "action",
+        "token_symbol",
+        "token_name",
+        "amount",
+        "sold_symbol",
+        "sold_amount",
+        "bought_symbol",
+        "bought_amount",
+        "exchangeName",
+        "priceUsd",
+        "liquidityUsd",
+        "volume24h",
+        "priceChangeH24",
+        "pairUrl",
+        "tx_hash",
+    ]],
+    use_container_width=True,
+    hide_index=True,
+)
 
 if errors:
     with st.expander("API errors", expanded=True):
@@ -405,3 +428,39 @@ for col in ["priceChangeM5", "priceChangeH1", "priceChangeH6", "priceChangeH24"]
 st.dataframe(
     display[
         [
+            "timestamp",
+            "wallet_label",
+            "chain",
+            "action",
+            "token_symbol",
+            "token_name",
+            "amount",
+            "sold_symbol",
+            "sold_amount",
+            "bought_symbol",
+            "bought_amount",
+            "exchangeName",
+            "priceUsd",
+            "liquidityUsd",
+            "volume24h",
+            "priceChangeH24",
+            "pairUrl",
+            "tx_hash",
+        ]
+    ],
+    use_container_width=True,
+    hide_index=True,
+)
+
+with st.expander("How to use this app"):
+    st.markdown(
+        """
+1. Add your Moralis API key.
+2. Add real wallets in `label,address,chain` format.
+3. Click **Refresh**.
+4. Start with 3-5 wallets you know are active on DEXs.
+5. Check **Wallet diagnostics** first, then **Consensus buys**.
+
+This version uses the Moralis wallet swaps endpoint instead of raw ERC-20 transfers, which is a better fit for trader tracking.
+        """
+    )
