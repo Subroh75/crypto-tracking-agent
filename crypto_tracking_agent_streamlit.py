@@ -333,6 +333,38 @@ def score_signal(wallet_count: int, buy_events: int, liquidity: float, volume_24
     return score, "Ignore"
 
 
+def classify_setup(price_change_h24: float, wallet_count: int, buy_events: int) -> str:
+    if wallet_count >= 2 and price_change_h24 < 10 and buy_events >= 2:
+        return "Early Accumulation"
+    if wallet_count >= 2 and 10 <= price_change_h24 <= 25:
+        return "Momentum Ignition"
+    if price_change_h24 > 25:
+        return "Extended"
+    if wallet_count == 1 and buy_events >= 3 and price_change_h24 < 12:
+        return "Single-Wallet Accumulation"
+    return "Developing"
+
+
+def classify_entry_signal(setup_type: str) -> str:
+    if setup_type == "Early Accumulation":
+        return "Stalk entry / small starter"
+    if setup_type == "Momentum Ignition":
+        return "Enter on continuation"
+    if setup_type == "Extended":
+        return "Wait for pullback"
+    if setup_type == "Single-Wallet Accumulation":
+        return "Wait for second wallet confirmation"
+    return "Monitor only"
+
+
+def classify_risk(liquidity: float, wallet_count: int) -> str:
+    if liquidity > 250_000 and wallet_count >= 2:
+        return "Low"
+    if liquidity > 100_000:
+        return "Medium"
+    return "High"
+
+
 def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd.DataFrame:
     buys = df[df["action"] == "BUY"].copy()
     if buys.empty:
@@ -356,6 +388,9 @@ def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd
     grouped["wallet_styles"] = grouped["wallets"].apply(lambda text: ", ".join(sorted({style_lookup.get(w.strip(), "unknown") for w in text.split(",") if w.strip()})))
     grouped["signal_score"] = grouped.apply(lambda r: score_signal(int(r["wallet_count"]), int(r["buy_events"]), safe_float(r["liquidity_usd"]), safe_float(r["volume_24h"]), safe_float(r["price_change_h24"]))[0], axis=1)
     grouped["signal_label"] = grouped.apply(lambda r: score_signal(int(r["wallet_count"]), int(r["buy_events"]), safe_float(r["liquidity_usd"]), safe_float(r["volume_24h"]), safe_float(r["price_change_h24"]))[1], axis=1)
+    grouped["setup_type"] = grouped.apply(lambda r: classify_setup(safe_float(r["price_change_h24"]), int(r["wallet_count"]), int(r["buy_events"])), axis=1)
+    grouped["entry_signal"] = grouped["setup_type"].apply(classify_entry_signal)
+    grouped["risk_level"] = grouped.apply(lambda r: classify_risk(safe_float(r["liquidity_usd"]), int(r["wallet_count"])), axis=1)
     return grouped.sort_values(["signal_score", "wallet_count", "buy_events"], ascending=False)
 
 
@@ -382,6 +417,9 @@ def build_fusion_panel(consensus_df: pd.DataFrame, social_df: pd.DataFrame) -> p
         out["liquidity_usd"] = None
         out["volume_24h"] = None
         out["price_change_h24"] = None
+        out["setup_type"] = "No on-chain"
+        out["entry_signal"] = "Monitor only"
+        out["risk_level"] = "Unknown"
         out["fusion_score"] = out["social_score"]
         out["fusion_label"] = out["fusion_score"].apply(lambda s: "Narrative only" if s >= 20 else "Ignore")
         return out
@@ -398,7 +436,7 @@ def build_fusion_panel(consensus_df: pd.DataFrame, social_df: pd.DataFrame) -> p
     merged = consensus_df.merge(social_df, on="token_symbol", how="outer")
     for col in ["signal_score", "social_score", "wallet_count", "buy_events", "mentions", "influencers"]:
         merged[col] = merged[col].fillna(0)
-    for col in ["wallets", "wallet_styles", "note"]:
+    for col in ["wallets", "wallet_styles", "note", "setup_type", "entry_signal", "risk_level"]:
         if col in merged.columns:
             merged[col] = merged[col].fillna("")
     merged["chain"] = merged["chain"].fillna("eth")
@@ -555,21 +593,9 @@ with left_col:
             display_consensus[col] = display_consensus[col].apply(fmt_num)
         display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{safe_float(x):.2f}%")
         st.dataframe(display_consensus[[
-            "signal_score",
-            "signal_label",
-            "chain",
-            "token_symbol",
-            "token_name",
-            "wallet_count",
-            "buy_events",
-            "wallets",
-            "wallet_styles",
-            "price_usd",
-            "liquidity_usd",
-            "volume_24h",
-            "price_change_h24",
-            "last_seen",
-            "pair_url",
+            "signal_score", "signal_label", "setup_type", "entry_signal", "risk_level", "chain",
+            "token_symbol", "token_name", "wallet_count", "buy_events", "wallets", "wallet_styles",
+            "price_usd", "liquidity_usd", "volume_24h", "price_change_h24", "last_seen", "pair_url"
         ]], use_container_width=True, hide_index=True)
 
 with right_col:
@@ -593,8 +619,9 @@ else:
         fusion_display["price_change_h24"] = fusion_display["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{safe_float(x):.2f}%")
     show_cols = [c for c in [
         "fusion_score", "fusion_label", "token_symbol", "chain", "signal_score", "social_score",
-        "wallet_count", "buy_events", "mentions", "influencers", "sentiment", "wallets",
-        "wallet_styles", "liquidity_usd", "volume_24h", "price_change_h24", "note", "pair_url"
+        "setup_type", "entry_signal", "risk_level", "wallet_count", "buy_events", "mentions",
+        "influencers", "sentiment", "wallets", "wallet_styles", "liquidity_usd", "volume_24h",
+        "price_change_h24", "note", "pair_url"
     ] if c in fusion_display.columns]
     st.dataframe(fusion_display[show_cols], use_container_width=True, hide_index=True)
 
@@ -603,6 +630,7 @@ else:
     selected_row = fusion_df.iloc[options.index(selected)]
     st.write(
         f"{selected_row.get('token_symbol', 'Unknown')} is classified as {selected_row.get('fusion_label', 'Watch')} with fusion score {int(selected_row.get('fusion_score', 0) or 0)}. "
+        f"Setup: {selected_row.get('setup_type', 'Unknown')}. Entry: {selected_row.get('entry_signal', 'Monitor only')}. Risk: {selected_row.get('risk_level', 'Unknown')}. "
         f"On-chain score {int(selected_row.get('signal_score', 0) or 0)}, social score {int(selected_row.get('social_score', 0) or 0)}. "
         f"Wallets: {selected_row.get('wallets', '') or 'none'}. Social note: {selected_row.get('note', '') or 'none'}."
     )
@@ -624,19 +652,17 @@ st.dataframe(display[[
 with st.expander("Notes"):
     st.markdown(
         """
-This version adds a simple two-panel scanner plus a fusion layer.
+This version includes entry intelligence.
 
-What is included:
-- persistent wallet list
-- wallet diagnostics
-- swap tracking
-- token enrichment
-- wallet profiling
-- on-chain signal scoring
-- social watchlist input
-- fusion scoring between narrative and whale activity
+New fields:
+- `setup_type`
+- `entry_signal`
+- `risk_level`
 
-Paste social rows as:
-`ticker,mentions,influencers,sentiment,note`
+Interpretation:
+- Early Accumulation = stalk entry / small starter
+- Momentum Ignition = enter on continuation
+- Extended = wait for pullback
+- Single-Wallet Accumulation = wait for second wallet confirmation
         """
     )
