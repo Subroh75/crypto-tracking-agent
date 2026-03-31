@@ -10,11 +10,13 @@ import streamlit as st
 from openai import OpenAI
 
 APP_TITLE = "Crypto Tracking Agent"
-APP_SUBTITLE = "Track wallet swaps, score signals, and review token momentum"
+APP_SUBTITLE = "Track wallet swaps, score signals, analyze setups, and discover new wallets"
 MORALIS_BASE = "https://deep-index.moralis.io/api/v2.2"
 REQUEST_TIMEOUT = 20
 DEFAULT_LOOKBACK_HOURS = 48
 DEFAULT_LIMIT = 30
+WALLETS_FILE = "wallets.txt"
+
 SUPPORTED_CHAINS = {
     "eth": "Ethereum",
     "bsc": "BNB Chain",
@@ -24,6 +26,7 @@ SUPPORTED_CHAINS = {
     "optimism": "Optimism",
     "avalanche": "Avalanche",
 }
+
 DEXSCREENER_CHAIN_MAP = {
     "eth": "ethereum",
     "bsc": "bsc",
@@ -33,6 +36,7 @@ DEXSCREENER_CHAIN_MAP = {
     "optimism": "optimism",
     "avalanche": "avalanche",
 }
+
 STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "FDUSD", "TUSD", "USDE", "USDC.E", "USDT.E"}
 IGNORE_SYMBOLS = STABLE_SYMBOLS.union({"WETH", "WBTC", "ETH", "BNB", "MATIC", "AVAX", "OP", "ARB"})
 
@@ -47,18 +51,47 @@ def fmt_num(value: Any) -> str:
     except Exception:
         return "-"
     if abs(num) >= 1_000_000_000:
-        return f"{num/1_000_000_000:.2f}B"
+        return f"{num / 1_000_000_000:.2f}B"
     if abs(num) >= 1_000_000:
-        return f"{num/1_000_000:.2f}M"
+        return f"{num / 1_000_000:.2f}M"
     if abs(num) >= 1_000:
-        return f"{num/1_000:.2f}K"
+        return f"{num / 1_000:.2f}K"
     if abs(num) >= 1:
         return f"{num:.2f}"
     return f"{num:.6f}"
 
 
+def safe_get(d: Dict[str, Any], *keys: str, default=None):
+    cur: Any = d
+    for key in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return cur if cur is not None else default
+
+
+def load_wallets_from_file() -> str:
+    try:
+        with open(WALLETS_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
+
+def save_wallets_to_file(wallets_text: str) -> Tuple[bool, str]:
+    try:
+        with open(WALLETS_FILE, "w", encoding="utf-8") as f:
+            f.write(wallets_text.strip() + "\n" if wallets_text.strip() else "")
+        return True, f"Saved wallets to {WALLETS_FILE}"
+    except Exception as exc:
+        return False, f"Failed to save wallets: {exc}"
+
+
 def parse_wallets(text: str) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
+    seen = set()
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
@@ -71,19 +104,16 @@ def parse_wallets(text: str) -> List[Dict[str, str]]:
             label, address, chain = parts[0], parts[1], parts[2].lower()
         else:
             continue
+        if not address.startswith("0x"):
+            continue
         if chain not in SUPPORTED_CHAINS:
             chain = "eth"
+        key = (address.lower(), chain)
+        if key in seen:
+            continue
+        seen.add(key)
         rows.append({"label": label, "address": address.lower(), "chain": chain})
     return rows
-
-
-def safe_get(d: Dict[str, Any], *keys: str, default=None):
-    cur: Any = d
-    for key in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(key)
-    return cur if cur is not None else default
 
 
 @st.cache_data(ttl=60)
@@ -114,6 +144,8 @@ def get_wallet_swaps(address: str, chain: str, api_key: str, hours_back: int, li
     if resp.status_code != 200:
         raise RuntimeError(f"Moralis swaps error {resp.status_code}: {resp.text[:250]}")
     data = resp.json() or {}
+    if isinstance(data, list):
+        return data
     return data.get("result", []) or []
 
 
@@ -147,6 +179,28 @@ def get_token_market_snapshot(chain: str, token_address: str) -> Dict[str, Any]:
         "pairUrl": best.get("url"),
         "dexId": best.get("dexId"),
     }
+
+
+@st.cache_data(ttl=300)
+def get_top_traders_by_token(token_address: str, chain: str, api_key: str) -> List[Dict[str, Any]]:
+    candidate_paths = [
+        f"{MORALIS_BASE}/erc20/{token_address}/top-gainers",
+        f"{MORALIS_BASE}/erc20/{token_address}/top-traders",
+    ]
+    headers = {"X-API-Key": api_key}
+    params = {"chain": chain}
+    for url in candidate_paths:
+        resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            continue
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            results = data.get("result") or data.get("top_gainers") or data.get("topTraders") or []
+            if results:
+                return results
+    return []
 
 
 def normalize_swap(item: Dict[str, Any], wallet_meta: Dict[str, str]) -> Dict[str, Any]:
@@ -206,7 +260,7 @@ def enrich_signals(df: pd.DataFrame) -> pd.DataFrame:
         if not token_address:
             continue
         snapshots[(chain, token_address)] = get_token_market_snapshot(chain, token_address)
-        time.sleep(0.08)
+        time.sleep(0.05)
 
     def col(row: pd.Series, key: str):
         return snapshots.get((row["chain"], row["token_address"]), {}).get(key)
@@ -235,8 +289,8 @@ def classify_wallet_style(wallet_df: pd.DataFrame) -> str:
     total = len(wallet_df)
     unique_tokens = wallet_df["token_symbol"].nunique()
     buy_ratio = (wallet_df["action"] == "BUY").mean()
-    avg_gap_minutes = 0.0
     timestamps = wallet_df["timestamp"].dropna().sort_values()
+    avg_gap_minutes = 0.0
     if len(timestamps) >= 2:
         diffs = timestamps.diff().dropna().dt.total_seconds() / 60
         if not diffs.empty:
@@ -357,7 +411,7 @@ def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd
     if buys.empty:
         return pd.DataFrame()
 
-    style_lookup = {}
+    style_lookup: Dict[str, str] = {}
     if not wallet_profiles.empty:
         style_lookup = dict(zip(wallet_profiles["wallet_label"], wallet_profiles["style"]))
 
@@ -480,7 +534,7 @@ def local_ai_signal_brief(payload: Dict[str, Any]) -> Dict[str, str]:
 
 def llm_signal_brief_openai(payload: Dict[str, Any], api_key: str, model: str) -> Dict[str, str]:
     client = OpenAI(api_key=api_key)
-    prompt = (
+    developer_prompt = (
         "You are a crypto signal analyst. Use only the JSON provided. Do not invent facts. "
         "Return strict JSON with keys: summary, action, risk. "
         "Focus on signal quality, accumulation behavior, liquidity risk, momentum risk, and whether the signal is ignore/watch/strong watch/high conviction. "
@@ -489,12 +543,12 @@ def llm_signal_brief_openai(payload: Dict[str, Any], api_key: str, model: str) -
     response = client.responses.create(
         model=model,
         input=[
-            {"role": "developer", "content": prompt},
+            {"role": "developer", "content": developer_prompt},
             {"role": "user", "content": json.dumps(payload, default=str)},
         ],
         text={"format": {"type": "json_object"}},
     )
-    content = getattr(response, "output_text", "") or ""
+    content = getattr(response, "output_text", "") or "{}"
     data = json.loads(content)
     return {
         "summary": str(data.get("summary", "No summary returned.")).strip(),
@@ -515,23 +569,12 @@ def generate_signal_brief(payload: Dict[str, Any], provider: str, api_key: str, 
     return local_ai_signal_brief(payload)
 
 
-@st.cache_data(ttl=300)
-def get_top_traders_by_token(token_address: str, chain: str, api_key: str) -> List[Dict[str, Any]]:
-    url = f"{MORALIS_BASE}/erc20/{token_address}/top-gainers"
-    headers = {"X-API-Key": api_key}
-    params = {"chain": chain}
-    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Moralis top traders error {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("result", []) or data.get("top_gainers", []) or data.get("topTraders", []) or []
-    return []
-
-
-def discover_wallet_candidates(consensus_df: pd.DataFrame, existing_wallets: List[Dict[str, str]], api_key: str, top_n_tokens: int = 3) -> pd.DataFrame:
+def discover_wallet_candidates(
+    consensus_df: pd.DataFrame,
+    existing_wallets: List[Dict[str, str]],
+    api_key: str,
+    top_n_tokens: int = 3,
+) -> pd.DataFrame:
     if consensus_df.empty:
         return pd.DataFrame()
 
@@ -545,9 +588,9 @@ def discover_wallet_candidates(consensus_df: pd.DataFrame, existing_wallets: Lis
         chain = str(token_row.get("chain") or "eth")
         if not token_address:
             continue
-        try:
-            traders = get_top_traders_by_token(token_address, chain, api_key)
-        except Exception:
+
+        traders = get_top_traders_by_token(token_address, chain, api_key)
+        if not traders:
             continue
 
         for idx, trader in enumerate(traders, start=1):
@@ -566,6 +609,7 @@ def discover_wallet_candidates(consensus_df: pd.DataFrame, existing_wallets: Lis
                 pnl = trader.get("total_profit_usd")
             if pnl is None:
                 pnl = trader.get("profit_usd")
+
             score = 0
             try:
                 score += max(0, min(int(float(pnl or 0) / 100), 40))
@@ -579,16 +623,18 @@ def discover_wallet_candidates(consensus_df: pd.DataFrame, existing_wallets: Lis
             while auto_label in existing_labels:
                 auto_label = f"{auto_label}_x"
 
-            rows.append({
-                "suggested_label": auto_label,
-                "address": address,
-                "chain": chain,
-                "seed_token": token_row.get("token_symbol"),
-                "seed_signal_score": token_row.get("signal_score"),
-                "top_trader_rank": idx,
-                "profit_usd": pnl,
-                "discovery_score": score,
-            })
+            rows.append(
+                {
+                    "suggested_label": auto_label,
+                    "address": address,
+                    "chain": chain,
+                    "seed_token": token_row.get("token_symbol"),
+                    "seed_signal_score": token_row.get("signal_score"),
+                    "top_trader_rank": idx,
+                    "profit_usd": pnl,
+                    "discovery_score": score,
+                }
+            )
 
     if not rows:
         return pd.DataFrame()
@@ -599,44 +645,84 @@ def discover_wallet_candidates(consensus_df: pd.DataFrame, existing_wallets: Lis
     return out.head(20)
 
 
+def default_wallets_text() -> str:
+    stored = load_wallets_from_file().strip()
+    if stored:
+        return stored
+    return "\n".join(
+        [
+            "alpha1,0x1dc89ab25ab5d8714fcf9ee4bd9c9a58debeb4d8,eth",
+            "alpha2,0xc5e9f816994d3eb91b556bc8d0a0cbe44a674909,eth",
+            "alpha3,0x31c28fe6dbc15930d4d670af8f1d7f4ee4a6cd95,eth",
+            "alpha4,0x31a0a6ce4a67dcb2ff37b1b3e0cbf32a599f6d5a,eth",
+            "alpha5,0xb7b78a8a908acf3c72a9c30c4e0a413c6b020611,eth",
+        ]
+    )
+
+
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
 
+if "wallets_text" not in st.session_state:
+    st.session_state.wallets_text = default_wallets_text()
+
 with st.sidebar:
     st.header("Configuration")
     st.markdown("Enter wallets as one per line: `label,address,chain`  \nExample: `alpha,0x1234...,base`")
+
     wallets_text = st.text_area(
         "Tracked wallets",
-        value="",
-        height=180,
+        value=st.session_state.wallets_text,
+        height=220,
         placeholder="alpha,0x1234...,base\nbeta,0xabcd...,eth",
     )
-    default_api_key = st.secrets.get("MORALIS_API_KEY", "") if hasattr(st, "secrets") else ""
-    moralis_api_key = st.text_input("Moralis API key", value=default_api_key, type="password")
+    st.session_state.wallets_text = wallets_text
+
+    col_save, col_reload = st.columns(2)
+    with col_save:
+        if st.button("Save wallets"):
+            ok, message = save_wallets_to_file(wallets_text)
+            if ok:
+                st.success(message)
+            else:
+                st.error(message)
+    with col_reload:
+        if st.button("Reload file"):
+            st.session_state.wallets_text = default_wallets_text()
+            st.rerun()
+
+    try:
+        default_moralis_key = st.secrets.get("MORALIS_API_KEY", "")
+    except Exception:
+        default_moralis_key = os.getenv("MORALIS_API_KEY", "")
+    moralis_api_key = st.text_input("Moralis API key", value=default_moralis_key, type="password")
+
     hours_back = st.slider("Lookback window (hours)", 6, 168, DEFAULT_LOOKBACK_HOURS, 6)
     limit = st.slider("Max swaps per wallet", 10, 100, DEFAULT_LIMIT, 10)
     min_wallet_consensus = st.slider("Minimum wallets buying same token", 1, 5, 2, 1)
     hide_majors = st.checkbox("Hide majors / stablecoins", value=True)
     only_buys = st.checkbox("Only show BUY signals", value=True)
     show_debug_json = st.checkbox("Show AI payload JSON", value=False)
+
     st.markdown("### AI analysis")
     ai_provider = st.selectbox("AI provider", ["Local rules only", "OpenAI"])
-    default_openai_key = ""
     try:
         default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
         default_openai_key = os.getenv("OPENAI_API_KEY", "")
     openai_api_key = st.text_input("OpenAI API key", value=default_openai_key, type="password")
     openai_model = st.text_input("OpenAI model", value="gpt-5")
+
+    st.markdown("### Discovery")
     auto_discover_wallets = st.checkbox("Auto-discover wallet candidates", value=False)
     discovery_seed_count = st.slider("Discovery seed tokens", 1, 5, 3, 1)
+
     refresh = st.button("Refresh")
+    if refresh:
+        st.cache_data.clear()
 
-wallets = parse_wallets(wallets_text)
-if refresh:
-    st.cache_data.clear()
-
+wallets = parse_wallets(st.session_state.wallets_text)
 if not wallets:
     st.info("Add at least one real wallet in the sidebar to begin.")
     st.stop()
@@ -651,14 +737,16 @@ all_rows: List[Dict[str, Any]] = []
 with st.spinner("Fetching wallet activity..."):
     for wallet in wallets:
         stats = get_wallet_stats(wallet["address"], wallet["chain"], moralis_api_key)
-        stats_rows.append({
-            "wallet_label": wallet["label"],
-            "chain": wallet["chain"],
-            "address": wallet["address"],
-            "token_transfers_total": safe_get(stats, "token_transfers", "total", default=0),
-            "transactions_total": safe_get(stats, "transactions", "total", default=0),
-            "stats_error": stats.get("error", "") if isinstance(stats, dict) else "",
-        })
+        stats_rows.append(
+            {
+                "wallet_label": wallet["label"],
+                "chain": wallet["chain"],
+                "address": wallet["address"],
+                "token_transfers_total": safe_get(stats, "token_transfers", "total", default=0),
+                "transactions_total": safe_get(stats, "transactions", "total", default=0),
+                "stats_error": stats.get("error", "") if isinstance(stats, dict) else "",
+            }
+        )
         try:
             swaps = get_wallet_swaps(wallet["address"], wallet["chain"], moralis_api_key, hours_back, limit)
             for item in swaps:
@@ -690,6 +778,10 @@ if hide_majors:
     signals_df = signals_df[~signals_df["token_symbol"].isin(IGNORE_SYMBOLS)]
 
 signals_df = enrich_signals(signals_df)
+if signals_df.empty:
+    st.info("Activity exists, but nothing passed the current filters. Turn off filters or widen the lookback window.")
+    st.stop()
+
 wallet_profiles_df = build_wallet_profiles(signals_df)
 consensus_df = build_consensus_table(signals_df, wallet_profiles_df)
 if not consensus_df.empty:
@@ -700,10 +792,6 @@ col1.metric("Tracked wallets", len(wallets))
 col2.metric("Signals", len(signals_df))
 col3.metric("Unique tokens", int(signals_df["token_address"].nunique()) if not signals_df.empty else 0)
 col4.metric("Last refresh (UTC)", now_utc().strftime("%Y-%m-%d %H:%M:%S"))
-
-if signals_df.empty:
-    st.info("Activity exists, but nothing passed the current filters. Turn off 'Hide majors / stablecoins' or 'Only show BUY signals'.")
-    st.stop()
 
 st.subheader("Wallet intelligence")
 if wallet_profiles_df.empty:
@@ -720,7 +808,9 @@ else:
     display_consensus = consensus_df.copy()
     for col in ["price_usd", "liquidity_usd", "volume_24h"]:
         display_consensus[col] = display_consensus[col].apply(fmt_num)
-    display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%")
+    display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(
+        lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%"
+    )
     st.dataframe(
         display_consensus[[
             "signal_score",
@@ -745,7 +835,10 @@ else:
         hide_index=True,
     )
 
-    signal_options = [f"{row.token_symbol} | {row.chain} | {row.signal_label} | {row.signal_score}" for _, row in consensus_df.iterrows()]
+    signal_options = [
+        f"{row.token_symbol} | {row.chain} | {row.signal_label} | {row.signal_score}"
+        for _, row in consensus_df.iterrows()
+    ]
     selected_option = st.selectbox("Analyze one signal", signal_options)
     selected_index = signal_options.index(selected_option)
     selected_row = consensus_df.iloc[selected_index]
@@ -772,14 +865,29 @@ if auto_discover_wallets:
         candidates_display["profit_usd"] = candidates_display["profit_usd"].apply(fmt_num)
         st.dataframe(candidates_display, use_container_width=True, hide_index=True)
 
-        # Fix string construction for suggested wallets
-        lines = []
+        lines: List[str] = []
         for row in candidates_df.itertuples(index=False):
             lines.append(f"{row.suggested_label},{row.address},{row.chain}")
-        suggested_wallets_text = "
-".join(lines)
+        suggested_wallets_text = "\n".join(lines)
+
         st.markdown("### Suggested wallets to add")
         st.code(suggested_wallets_text, language="text")
+
+        if st.button("Append discovered wallets to tracked list"):
+            merged_text = st.session_state.wallets_text.strip()
+            addition = suggested_wallets_text.strip()
+            if addition:
+                if merged_text:
+                    merged_text = merged_text + "\n" + addition
+                else:
+                    merged_text = addition
+                st.session_state.wallets_text = merged_text
+                ok, message = save_wallets_to_file(merged_text)
+                if ok:
+                    st.success("Discovered wallets added and saved. Click Refresh.")
+                else:
+                    st.warning("Wallets added to session, but saving to file failed.")
+                st.rerun()
 
 st.subheader("Recent wallet swaps")
 display = signals_df.copy()
@@ -819,12 +927,13 @@ with st.expander("How to use this app"):
     st.markdown(
         """
 1. Add your Moralis API key.
-2. Add real wallets in `label,address,chain` format.
+2. Edit or save wallets in the sidebar.
 3. Click **Refresh**.
 4. Check **Wallet intelligence** to see whether a wallet looks rotational, concentrated, or mixed.
 5. Check **Consensus buys + signal intelligence** to find the highest-scoring setups.
 6. Read the **AI signal brief** for a plain-English interpretation.
+7. Turn on **Auto-discover wallet candidates** to find new wallets from your top token signals.
 
-This version adds a built-in signal intelligence layer using deterministic scoring plus either a local AI-style explanation module or a real OpenAI model through the Responses API. It can also auto-discover wallet candidates from the strongest current token signals by querying token top traders.
+This version includes wallet persistence, scoring, AI analysis, and wallet discovery.
         """
     )
