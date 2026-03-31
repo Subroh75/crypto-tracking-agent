@@ -772,10 +772,12 @@ if auto_discover_wallets:
         candidates_display["profit_usd"] = candidates_display["profit_usd"].apply(fmt_num)
         st.dataframe(candidates_display, use_container_width=True, hide_index=True)
 
+        # Fix string construction for suggested wallets
+        lines = []
+        for row in candidates_df.itertuples(index=False):
+            lines.append(f"{row.suggested_label},{row.address},{row.chain}")
         suggested_wallets_text = "
-".join(
-            f"{row.suggested_label},{row.address},{row.chain}" for row in candidates_df.itertuples(index=False)
-        )
+".join(lines)
         st.markdown("### Suggested wallets to add")
         st.code(suggested_wallets_text, language="text")
 
