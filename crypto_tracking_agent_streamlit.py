@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -6,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from openai import OpenAI
 
 APP_TITLE = "Crypto Tracking Agent"
 APP_SUBTITLE = "Track wallet swaps, score signals, and review token momentum"
@@ -472,7 +474,129 @@ def local_ai_signal_brief(payload: Dict[str, Any]) -> Dict[str, str]:
         "summary": " ".join(summary_parts),
         "action": action,
         "risk": risk,
+        "source": "local_rules",
     }
+
+
+def llm_signal_brief_openai(payload: Dict[str, Any], api_key: str, model: str) -> Dict[str, str]:
+    client = OpenAI(api_key=api_key)
+    prompt = (
+        "You are a crypto signal analyst. Use only the JSON provided. Do not invent facts. "
+        "Return strict JSON with keys: summary, action, risk. "
+        "Focus on signal quality, accumulation behavior, liquidity risk, momentum risk, and whether the signal is ignore/watch/strong watch/high conviction. "
+        "Keep each field under 80 words."
+    )
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "developer", "content": prompt},
+            {"role": "user", "content": json.dumps(payload, default=str)},
+        ],
+        text={"format": {"type": "json_object"}},
+    )
+    content = getattr(response, "output_text", "") or ""
+    data = json.loads(content)
+    return {
+        "summary": str(data.get("summary", "No summary returned.")).strip(),
+        "action": str(data.get("action", "No action returned.")).strip(),
+        "risk": str(data.get("risk", "No risk returned.")).strip(),
+        "source": f"openai:{model}",
+    }
+
+
+def generate_signal_brief(payload: Dict[str, Any], provider: str, api_key: str, model: str) -> Dict[str, str]:
+    if provider == "OpenAI" and api_key:
+        try:
+            return llm_signal_brief_openai(payload, api_key, model)
+        except Exception as exc:
+            fallback = local_ai_signal_brief(payload)
+            fallback["source"] = f"fallback_local_rules ({exc})"
+            return fallback
+    return local_ai_signal_brief(payload)
+
+
+@st.cache_data(ttl=300)
+def get_top_traders_by_token(token_address: str, chain: str, api_key: str) -> List[Dict[str, Any]]:
+    url = f"{MORALIS_BASE}/erc20/{token_address}/top-gainers"
+    headers = {"X-API-Key": api_key}
+    params = {"chain": chain}
+    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Moralis top traders error {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("result", []) or data.get("top_gainers", []) or data.get("topTraders", []) or []
+    return []
+
+
+def discover_wallet_candidates(consensus_df: pd.DataFrame, existing_wallets: List[Dict[str, str]], api_key: str, top_n_tokens: int = 3) -> pd.DataFrame:
+    if consensus_df.empty:
+        return pd.DataFrame()
+
+    existing_addresses = {w["address"].lower() for w in existing_wallets}
+    existing_labels = {w["label"] for w in existing_wallets}
+    rows: List[Dict[str, Any]] = []
+    seed_df = consensus_df.sort_values(["signal_score", "buy_events"], ascending=False).head(top_n_tokens)
+
+    for _, token_row in seed_df.iterrows():
+        token_address = str(token_row.get("token_address") or "").lower()
+        chain = str(token_row.get("chain") or "eth")
+        if not token_address:
+            continue
+        try:
+            traders = get_top_traders_by_token(token_address, chain, api_key)
+        except Exception:
+            continue
+
+        for idx, trader in enumerate(traders, start=1):
+            address = str(
+                trader.get("address")
+                or trader.get("wallet_address")
+                or trader.get("owner_of")
+                or trader.get("wallet")
+                or ""
+            ).lower()
+            if not address or address in existing_addresses:
+                continue
+
+            pnl = trader.get("realized_profit_usd")
+            if pnl is None:
+                pnl = trader.get("total_profit_usd")
+            if pnl is None:
+                pnl = trader.get("profit_usd")
+            score = 0
+            try:
+                score += max(0, min(int(float(pnl or 0) / 100), 40))
+            except Exception:
+                pass
+            score += max(0, 25 - idx)
+            score += min(int(token_row.get("signal_score", 0) or 0) // 3, 25)
+
+            label_base = str(token_row.get("token_symbol") or "seed").lower()
+            auto_label = f"{label_base}_{idx}"
+            while auto_label in existing_labels:
+                auto_label = f"{auto_label}_x"
+
+            rows.append({
+                "suggested_label": auto_label,
+                "address": address,
+                "chain": chain,
+                "seed_token": token_row.get("token_symbol"),
+                "seed_signal_score": token_row.get("signal_score"),
+                "top_trader_rank": idx,
+                "profit_usd": pnl,
+                "discovery_score": score,
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["discovery_score", "top_trader_rank"], ascending=[False, True])
+    out = out.drop_duplicates(subset=["address", "chain"])
+    return out.head(20)
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -496,6 +620,17 @@ with st.sidebar:
     hide_majors = st.checkbox("Hide majors / stablecoins", value=True)
     only_buys = st.checkbox("Only show BUY signals", value=True)
     show_debug_json = st.checkbox("Show AI payload JSON", value=False)
+    st.markdown("### AI analysis")
+    ai_provider = st.selectbox("AI provider", ["Local rules only", "OpenAI"])
+    default_openai_key = ""
+    try:
+        default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        default_openai_key = os.getenv("OPENAI_API_KEY", "")
+    openai_api_key = st.text_input("OpenAI API key", value=default_openai_key, type="password")
+    openai_model = st.text_input("OpenAI model", value="gpt-5")
+    auto_discover_wallets = st.checkbox("Auto-discover wallet candidates", value=False)
+    discovery_seed_count = st.slider("Discovery seed tokens", 1, 5, 3, 1)
     refresh = st.button("Refresh")
 
 wallets = parse_wallets(wallets_text)
@@ -615,15 +750,34 @@ else:
     selected_index = signal_options.index(selected_option)
     selected_row = consensus_df.iloc[selected_index]
     payload = make_signal_payload(selected_row)
-    analysis = local_ai_signal_brief(payload)
+    provider_name = "OpenAI" if ai_provider == "OpenAI" else "Local rules only"
+    analysis = generate_signal_brief(payload, provider_name, openai_api_key, openai_model)
 
     st.markdown("### AI signal brief")
+    st.caption(f"Analysis source: {analysis.get('source', 'unknown')}")
     st.write(analysis["summary"])
     st.write(f"**Suggested action:** {analysis['action']}")
     st.write(f"**Risk note:** {analysis['risk']}")
 
     if show_debug_json:
         st.code(json.dumps(payload, indent=2, default=str), language="json")
+
+if auto_discover_wallets:
+    st.subheader("Auto-discovered wallet candidates")
+    candidates_df = discover_wallet_candidates(consensus_df, wallets, moralis_api_key, discovery_seed_count)
+    if candidates_df.empty:
+        st.info("No wallet candidates were discovered from the current top signals.")
+    else:
+        candidates_display = candidates_df.copy()
+        candidates_display["profit_usd"] = candidates_display["profit_usd"].apply(fmt_num)
+        st.dataframe(candidates_display, use_container_width=True, hide_index=True)
+
+        suggested_wallets_text = "
+".join(
+            f"{row.suggested_label},{row.address},{row.chain}" for row in candidates_df.itertuples(index=False)
+        )
+        st.markdown("### Suggested wallets to add")
+        st.code(suggested_wallets_text, language="text")
 
 st.subheader("Recent wallet swaps")
 display = signals_df.copy()
@@ -669,6 +823,6 @@ with st.expander("How to use this app"):
 5. Check **Consensus buys + signal intelligence** to find the highest-scoring setups.
 6. Read the **AI signal brief** for a plain-English interpretation.
 
-This version adds a built-in signal intelligence layer using deterministic scoring plus an AI-style explanation module inside the app.
+This version adds a built-in signal intelligence layer using deterministic scoring plus either a local AI-style explanation module or a real OpenAI model through the Responses API. It can also auto-discover wallet candidates from the strongest current token signals by querying token top traders.
         """
     )
