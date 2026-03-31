@@ -1,3 +1,4 @@
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -7,7 +8,7 @@ import requests
 import streamlit as st
 
 APP_TITLE = "Crypto Tracking Agent"
-APP_SUBTITLE = "Track wallet swaps, spot repeated buys, and review token momentum"
+APP_SUBTITLE = "Track wallet swaps, score signals, and review token momentum"
 MORALIS_BASE = "https://deep-index.moralis.io/api/v2.2"
 REQUEST_TIMEOUT = 20
 DEFAULT_LOOKBACK_HOURS = 48
@@ -226,14 +227,143 @@ def enrich_signals(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_consensus_table(df: pd.DataFrame) -> pd.DataFrame:
+def classify_wallet_style(wallet_df: pd.DataFrame) -> str:
+    if wallet_df.empty:
+        return "unknown"
+    total = len(wallet_df)
+    unique_tokens = wallet_df["token_symbol"].nunique()
+    buy_ratio = (wallet_df["action"] == "BUY").mean()
+    avg_gap_minutes = 0.0
+    timestamps = wallet_df["timestamp"].dropna().sort_values()
+    if len(timestamps) >= 2:
+        diffs = timestamps.diff().dropna().dt.total_seconds() / 60
+        if not diffs.empty:
+            avg_gap_minutes = float(diffs.mean())
+
+    if total >= 8 and unique_tokens <= 3:
+        return "concentrated accumulator"
+    if total >= 8 and unique_tokens >= 6:
+        return "rotational trader"
+    if buy_ratio > 0.8 and avg_gap_minutes < 120 and total >= 5:
+        return "active buyer"
+    if buy_ratio < 0.35 and total >= 5:
+        return "distribution / seller"
+    return "mixed trader"
+
+
+def build_wallet_profiles(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for wallet_label, wallet_df in df.groupby("wallet_label"):
+        rows.append(
+            {
+                "wallet_label": wallet_label,
+                "chain": wallet_df["chain"].iloc[0],
+                "events": len(wallet_df),
+                "unique_tokens": wallet_df["token_symbol"].nunique(),
+                "buy_events": int((wallet_df["action"] == "BUY").sum()),
+                "sell_events": int((wallet_df["action"] == "SELL").sum()),
+                "largest_buy_amount": pd.to_numeric(
+                    wallet_df.loc[wallet_df["action"] == "BUY", "amount"], errors="coerce"
+                ).max(),
+                "style": classify_wallet_style(wallet_df),
+                "last_seen": wallet_df["timestamp"].max(),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["events", "buy_events"], ascending=False)
+
+
+def compute_signal_score(row: pd.Series) -> Tuple[int, str, List[str], List[str]]:
+    score = 0
+    strengths: List[str] = []
+    risks: List[str] = []
+
+    wallet_count = int(row.get("wallet_count", 0) or 0)
+    buy_events = int(row.get("buy_events", 0) or 0)
+    liquidity = float(row.get("liquidity_usd", 0) or 0)
+    volume_24h = float(row.get("volume_24h", 0) or 0)
+    price_change_h24 = float(row.get("price_change_h24", 0) or 0)
+
+    score += min(wallet_count * 20, 40)
+    if wallet_count >= 2:
+        strengths.append(f"{wallet_count} wallets bought the same token")
+    else:
+        risks.append("Only one wallet has bought this token so far")
+
+    score += min(buy_events * 4, 20)
+    if buy_events >= 3:
+        strengths.append(f"Repeated buying detected ({buy_events} buys)")
+
+    if liquidity > 250_000:
+        score += 20
+        strengths.append("High liquidity")
+    elif liquidity > 100_000:
+        score += 15
+        strengths.append("Healthy liquidity")
+    elif liquidity > 50_000:
+        score += 8
+        strengths.append("Usable liquidity")
+    else:
+        score -= 18
+        risks.append("Low liquidity raises slippage and exit risk")
+
+    if volume_24h > 250_000:
+        score += 15
+        strengths.append("Strong 24h volume")
+    elif volume_24h > 100_000:
+        score += 10
+        strengths.append("Solid 24h volume")
+    elif volume_24h > 25_000:
+        score += 5
+    else:
+        score -= 12
+        risks.append("Thin 24h volume")
+
+    if price_change_h24 > 25:
+        score -= 15
+        risks.append("Token may already be extended after a sharp 24h move")
+    elif price_change_h24 > 10:
+        score -= 8
+        risks.append("Momentum is already elevated")
+    elif -5 <= price_change_h24 <= 10:
+        score += 6
+        strengths.append("Price is not heavily extended")
+    elif price_change_h24 < -15:
+        score -= 6
+        risks.append("Falling price trend could indicate weak follow-through")
+
+    score = max(0, min(int(score), 100))
+
+    if score >= 75:
+        label = "High Conviction"
+    elif score >= 60:
+        label = "Strong Watch"
+    elif score >= 40:
+        label = "Watch"
+    elif score >= 20:
+        label = "Low Signal"
+    else:
+        label = "Ignore"
+
+    return score, label, strengths, risks
+
+
+def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd.DataFrame:
     buys = df[df["action"] == "BUY"].copy()
     if buys.empty:
         return pd.DataFrame()
+
+    style_lookup = {}
+    if not wallet_profiles.empty:
+        style_lookup = dict(zip(wallet_profiles["wallet_label"], wallet_profiles["style"]))
+
     grouped = (
         buys.groupby(["chain", "token_symbol", "token_name", "token_address"], dropna=False)
         .agg(
             wallets=("wallet_label", lambda s: ", ".join(sorted(set(s)))),
+            wallet_list=("wallet_label", lambda s: sorted(set(s))),
             wallet_count=("wallet_label", lambda s: len(set(s))),
             buy_events=("tx_hash", "count"),
             last_seen=("timestamp", "max"),
@@ -244,9 +374,105 @@ def build_consensus_table(df: pd.DataFrame) -> pd.DataFrame:
             pair_url=("pairUrl", "max"),
         )
         .reset_index()
-        .sort_values(["wallet_count", "buy_events", "liquidity_usd"], ascending=[False, False, False])
+    )
+
+    grouped["wallet_styles"] = grouped["wallet_list"].apply(
+        lambda wallet_list: ", ".join(sorted({style_lookup.get(w, "unknown") for w in wallet_list}))
+    )
+
+    signal_scores: List[int] = []
+    signal_labels: List[str] = []
+    strength_texts: List[str] = []
+    risk_texts: List[str] = []
+
+    for _, row in grouped.iterrows():
+        score, label, strengths, risks = compute_signal_score(row)
+        signal_scores.append(score)
+        signal_labels.append(label)
+        strength_texts.append("; ".join(strengths) if strengths else "-")
+        risk_texts.append("; ".join(risks) if risks else "-")
+
+    grouped["signal_score"] = signal_scores
+    grouped["signal_label"] = signal_labels
+    grouped["strengths"] = strength_texts
+    grouped["risks"] = risk_texts
+
+    grouped = grouped.sort_values(
+        ["signal_score", "wallet_count", "buy_events", "liquidity_usd"],
+        ascending=[False, False, False, False],
     )
     return grouped
+
+
+def make_signal_payload(row: pd.Series) -> Dict[str, Any]:
+    return {
+        "token": row.get("token_symbol"),
+        "token_name": row.get("token_name"),
+        "chain": row.get("chain"),
+        "wallet_count": int(row.get("wallet_count", 0) or 0),
+        "buy_events": int(row.get("buy_events", 0) or 0),
+        "wallets": [w.strip() for w in str(row.get("wallets", "")).split(",") if w.strip()],
+        "wallet_styles": row.get("wallet_styles", ""),
+        "price_usd": row.get("price_usd"),
+        "liquidity_usd": row.get("liquidity_usd"),
+        "volume_24h": row.get("volume_24h"),
+        "price_change_h24": row.get("price_change_h24"),
+        "signal_score": int(row.get("signal_score", 0) or 0),
+        "signal_label": row.get("signal_label"),
+        "strengths": row.get("strengths"),
+        "risks": row.get("risks"),
+        "pair_url": row.get("pair_url"),
+    }
+
+
+def local_ai_signal_brief(payload: Dict[str, Any]) -> Dict[str, str]:
+    score = int(payload.get("signal_score", 0) or 0)
+    label = str(payload.get("signal_label", "Watch"))
+    token = str(payload.get("token") or "Unknown")
+    wallet_count = int(payload.get("wallet_count", 0) or 0)
+    buy_events = int(payload.get("buy_events", 0) or 0)
+    liquidity = float(payload.get("liquidity_usd", 0) or 0)
+    volume_24h = float(payload.get("volume_24h", 0) or 0)
+    price_change = float(payload.get("price_change_h24", 0) or 0)
+    wallet_styles = str(payload.get("wallet_styles") or "unknown")
+
+    summary_parts = [
+        f"{token} is rated {label} with a score of {score}/100.",
+        f"The signal is based on {wallet_count} tracked wallet(s) and {buy_events} buy event(s).",
+        f"Wallet behavior looks like: {wallet_styles}.",
+    ]
+
+    if liquidity >= 100_000:
+        summary_parts.append("Liquidity is reasonably healthy for a short-term watchlist setup.")
+    elif liquidity >= 50_000:
+        summary_parts.append("Liquidity is usable but still thin enough to require caution.")
+    else:
+        summary_parts.append("Liquidity is low, so slippage and exit risk are elevated.")
+
+    if -5 <= price_change <= 10:
+        summary_parts.append("Price does not look heavily extended yet.")
+    elif price_change > 10:
+        summary_parts.append("Momentum is already elevated, so chasing becomes riskier.")
+    else:
+        summary_parts.append("Recent price weakness means follow-through is less certain.")
+
+    if wallet_count >= 2:
+        action = "Watch closely for follow-through or additional cluster buying."
+    elif buy_events >= 4 and liquidity >= 50_000:
+        action = "Keep it on the watchlist, but wait for another wallet to confirm the move."
+    else:
+        action = "Treat this as exploratory only, not a high-conviction setup."
+
+    risk = (
+        f"Key risks: {payload.get('risks', '-')}. "
+        f"24h volume is {fmt_num(volume_24h)} and liquidity is {fmt_num(liquidity)}."
+    )
+
+    return {
+        "summary": " ".join(summary_parts),
+        "action": action,
+        "risk": risk,
+    }
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -269,6 +495,7 @@ with st.sidebar:
     min_wallet_consensus = st.slider("Minimum wallets buying same token", 1, 5, 2, 1)
     hide_majors = st.checkbox("Hide majors / stablecoins", value=True)
     only_buys = st.checkbox("Only show BUY signals", value=True)
+    show_debug_json = st.checkbox("Show AI payload JSON", value=False)
     refresh = st.button("Refresh")
 
 wallets = parse_wallets(wallets_text)
@@ -328,6 +555,10 @@ if hide_majors:
     signals_df = signals_df[~signals_df["token_symbol"].isin(IGNORE_SYMBOLS)]
 
 signals_df = enrich_signals(signals_df)
+wallet_profiles_df = build_wallet_profiles(signals_df)
+consensus_df = build_consensus_table(signals_df, wallet_profiles_df)
+if not consensus_df.empty:
+    consensus_df = consensus_df[consensus_df["wallet_count"] >= min_wallet_consensus]
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Tracked wallets", len(wallets))
@@ -339,11 +570,15 @@ if signals_df.empty:
     st.info("Activity exists, but nothing passed the current filters. Turn off 'Hide majors / stablecoins' or 'Only show BUY signals'.")
     st.stop()
 
-consensus_df = build_consensus_table(signals_df)
-if not consensus_df.empty:
-    consensus_df = consensus_df[consensus_df["wallet_count"] >= min_wallet_consensus]
+st.subheader("Wallet intelligence")
+if wallet_profiles_df.empty:
+    st.info("No wallet profiles available yet.")
+else:
+    wallet_profiles_display = wallet_profiles_df.copy()
+    wallet_profiles_display["largest_buy_amount"] = wallet_profiles_display["largest_buy_amount"].apply(fmt_num)
+    st.dataframe(wallet_profiles_display, use_container_width=True, hide_index=True)
 
-st.subheader("Consensus buys")
+st.subheader("Consensus buys + signal intelligence")
 if consensus_df.empty:
     st.info("No repeated buys found across the selected wallets.")
 else:
@@ -353,22 +588,42 @@ else:
     display_consensus["price_change_h24"] = display_consensus["price_change_h24"].apply(lambda x: "-" if pd.isna(x) else f"{float(x):.2f}%")
     st.dataframe(
         display_consensus[[
+            "signal_score",
+            "signal_label",
             "chain",
             "token_symbol",
             "token_name",
             "wallet_count",
             "buy_events",
             "wallets",
+            "wallet_styles",
             "price_usd",
             "liquidity_usd",
             "volume_24h",
             "price_change_h24",
+            "strengths",
+            "risks",
             "last_seen",
             "pair_url",
         ]],
         use_container_width=True,
         hide_index=True,
     )
+
+    signal_options = [f"{row.token_symbol} | {row.chain} | {row.signal_label} | {row.signal_score}" for _, row in consensus_df.iterrows()]
+    selected_option = st.selectbox("Analyze one signal", signal_options)
+    selected_index = signal_options.index(selected_option)
+    selected_row = consensus_df.iloc[selected_index]
+    payload = make_signal_payload(selected_row)
+    analysis = local_ai_signal_brief(payload)
+
+    st.markdown("### AI signal brief")
+    st.write(analysis["summary"])
+    st.write(f"**Suggested action:** {analysis['action']}")
+    st.write(f"**Risk note:** {analysis['risk']}")
+
+    if show_debug_json:
+        st.code(json.dumps(payload, indent=2, default=str), language="json")
 
 st.subheader("Recent wallet swaps")
 display = signals_df.copy()
@@ -410,9 +665,10 @@ with st.expander("How to use this app"):
 1. Add your Moralis API key.
 2. Add real wallets in `label,address,chain` format.
 3. Click **Refresh**.
-4. Start with 3-5 wallets you know are active on DEXs.
-5. Check **Wallet diagnostics** first, then **Consensus buys**.
+4. Check **Wallet intelligence** to see whether a wallet looks rotational, concentrated, or mixed.
+5. Check **Consensus buys + signal intelligence** to find the highest-scoring setups.
+6. Read the **AI signal brief** for a plain-English interpretation.
 
-This version uses the Moralis wallet swaps endpoint instead of raw ERC-20 transfers, which is a better fit for trader tracking.
+This version adds a built-in signal intelligence layer using deterministic scoring plus an AI-style explanation module inside the app.
         """
     )
