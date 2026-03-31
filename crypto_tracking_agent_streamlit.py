@@ -1,28 +1,13 @@
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# ------------------------------
-# Simple Crypto Tracking Agent
-# ------------------------------
-# MVP purpose:
-# - Track selected wallets on EVM chains
-# - Pull recent token transfers from Moralis
-# - Infer simple BUY/SELL signals from inbound/outbound transfers
-# - Enrich tokens with DEX Screener market data
-# - Surface repeated buys across tracked wallets
-#
-# Notes:
-# - This is a research dashboard, not auto-trading software.
-# - Requires a Moralis API key for wallet transfer data.
-# - DEX Screener enrichment uses public endpoints.
-
 APP_TITLE = "Crypto Tracking Agent"
-APP_SUBTITLE = "Track wallets, spot repeated buys, and review token momentum"
+APP_SUBTITLE = "Track wallet swaps, spot repeated buys, and review token momentum"
 MORALIS_BASE = "https://deep-index.moralis.io/api/v2.2"
 REQUEST_TIMEOUT = 20
 DEFAULT_LOOKBACK_HOURS = 48
@@ -49,9 +34,6 @@ STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "FDUSD", "TUSD", "USDE", "USDC.
 IGNORE_SYMBOLS = STABLE_SYMBOLS.union({"WETH", "WBTC", "ETH", "BNB", "MATIC", "AVAX", "OP", "ARB"})
 
 
-# ------------------------------
-# Helpers
-# ------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -78,10 +60,7 @@ def parse_wallets(text: str) -> List[Dict[str, str]]:
         line = raw.strip()
         if not line:
             continue
-        if "," in line:
-            parts = [p.strip() for p in line.split(",")]
-        else:
-            parts = [p.strip() for p in line.split()]
+        parts = [p.strip() for p in line.split(",")]
         if len(parts) == 2:
             label, address = parts
             chain = "eth"
@@ -96,7 +75,7 @@ def parse_wallets(text: str) -> List[Dict[str, str]]:
 
 
 def safe_get(d: Dict[str, Any], *keys: str, default=None):
-    cur = d
+    cur: Any = d
     for key in keys:
         if not isinstance(cur, dict):
             return default
@@ -104,20 +83,22 @@ def safe_get(d: Dict[str, Any], *keys: str, default=None):
     return cur if cur is not None else default
 
 
-# ------------------------------
-# API Calls
-# ------------------------------
 @st.cache_data(ttl=60)
-def get_wallet_token_transfers(
-    address: str,
-    chain: str,
-    api_key: str,
-    hours_back: int,
-    limit: int,
-) -> List[Dict[str, Any]]:
+def get_wallet_stats(address: str, chain: str, api_key: str) -> Dict[str, Any]:
+    url = f"{MORALIS_BASE}/wallets/{address}/stats"
+    headers = {"X-API-Key": api_key}
+    params = {"chain": chain}
+    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+    if resp.status_code != 200:
+        return {"error": f"Moralis stats error {resp.status_code}: {resp.text[:180]}"}
+    return resp.json() or {}
+
+
+@st.cache_data(ttl=60)
+def get_wallet_swaps(address: str, chain: str, api_key: str, hours_back: int, limit: int) -> List[Dict[str, Any]]:
     to_date = now_utc()
     from_date = to_date - timedelta(hours=hours_back)
-    url = f"{MORALIS_BASE}/{address}/erc20/transfers"
+    url = f"{MORALIS_BASE}/wallets/{address}/swaps"
     headers = {"X-API-Key": api_key}
     params = {
         "chain": chain,
@@ -128,8 +109,8 @@ def get_wallet_token_transfers(
     }
     resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
     if resp.status_code != 200:
-        raise RuntimeError(f"Moralis error {resp.status_code}: {resp.text[:250]}")
-    data = resp.json()
+        raise RuntimeError(f"Moralis swaps error {resp.status_code}: {resp.text[:250]}")
+    data = resp.json() or {}
     return data.get("result", []) or []
 
 
@@ -162,50 +143,54 @@ def get_token_market_snapshot(chain: str, token_address: str) -> Dict[str, Any]:
         "priceChangeH24": safe_get(best, "priceChange", "h24"),
         "pairUrl": best.get("url"),
         "dexId": best.get("dexId"),
-        "pairAddress": best.get("pairAddress"),
     }
 
 
-# ------------------------------
-# Signal Logic
-# ------------------------------
-def infer_action(transfer: Dict[str, Any], wallet: str) -> str:
-    from_addr = str(transfer.get("from_address") or "").lower()
-    to_addr = str(transfer.get("to_address") or "").lower()
-    wallet = wallet.lower()
-    if to_addr == wallet and from_addr != wallet:
-        return "BUY"
-    if from_addr == wallet and to_addr != wallet:
-        return "SELL"
-    return "MOVE"
+def normalize_swap(item: Dict[str, Any], wallet_meta: Dict[str, str]) -> Dict[str, Any]:
+    bought = item.get("bought") or {}
+    sold = item.get("sold") or {}
 
+    bought_symbol = str(bought.get("symbol") or "").upper()
+    sold_symbol = str(sold.get("symbol") or "").upper()
+    bought_amount = bought.get("amount") or 0
+    sold_amount = sold.get("amount") or 0
 
-def normalize_transfer(transfer: Dict[str, Any], wallet_meta: Dict[str, str]) -> Dict[str, Any]:
-    decimals = int(transfer.get("token_decimals") or 0)
-    raw_value = transfer.get("value") or "0"
-    try:
-        amount = int(raw_value) / (10 ** decimals) if decimals >= 0 else 0
-    except Exception:
-        amount = 0
+    action = "BUY"
+    token_symbol = bought_symbol
+    token_name = bought.get("name") or ""
+    token_address = str(bought.get("address") or "").lower()
+    amount = bought_amount
 
-    symbol = (transfer.get("token_symbol") or "?").upper()
-    token_address = (transfer.get("address") or "").lower()
-    action = infer_action(transfer, wallet_meta["address"])
-    timestamp = transfer.get("block_timestamp") or transfer.get("blockTimestamp")
+    if bought_symbol in STABLE_SYMBOLS and sold_symbol not in STABLE_SYMBOLS and sold_symbol:
+        action = "SELL"
+        token_symbol = sold_symbol
+        token_name = sold.get("name") or ""
+        token_address = str(sold.get("address") or "").lower()
+        amount = sold_amount
+    elif not token_symbol and sold_symbol:
+        action = "SELL"
+        token_symbol = sold_symbol
+        token_name = sold.get("name") or ""
+        token_address = str(sold.get("address") or "").lower()
+        amount = sold_amount
 
     return {
         "wallet_label": wallet_meta["label"],
         "wallet_address": wallet_meta["address"],
         "chain": wallet_meta["chain"],
         "action": action,
-        "token_symbol": symbol,
-        "token_name": transfer.get("token_name") or "",
+        "token_symbol": token_symbol,
+        "token_name": token_name,
         "token_address": token_address,
         "amount": amount,
-        "timestamp": timestamp,
-        "tx_hash": transfer.get("transaction_hash") or "",
-        "from_address": transfer.get("from_address") or "",
-        "to_address": transfer.get("to_address") or "",
+        "timestamp": item.get("blockTimestamp") or item.get("block_timestamp"),
+        "tx_hash": item.get("transactionHash") or item.get("transaction_hash") or "",
+        "sold_symbol": sold_symbol,
+        "sold_amount": sold_amount,
+        "bought_symbol": bought_symbol,
+        "bought_amount": bought_amount,
+        "pairLabel": item.get("pairLabel") or item.get("pair_label") or "",
+        "exchangeName": item.get("exchangeName") or item.get("exchange_name") or "",
     }
 
 
@@ -244,11 +229,9 @@ def enrich_signals(df: pd.DataFrame) -> pd.DataFrame:
 def build_consensus_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-
     buys = df[df["action"] == "BUY"].copy()
     if buys.empty:
         return pd.DataFrame()
-
     grouped = (
         buys.groupby(["chain", "token_symbol", "token_name", "token_address"], dropna=False)
         .agg(
@@ -268,9 +251,6 @@ def build_consensus_table(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-# ------------------------------
-# UI
-# ------------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
@@ -283,15 +263,14 @@ with st.sidebar:
     )
     wallets_text = st.text_area(
         "Tracked wallets",
-        value=(
-            "alpha,0x000000000000000000000000000000000000dead,eth\n"
-            "beta,0x000000000000000000000000000000000000beef,base"
-        ),
-        height=160,
+        value="",
+        height=180,
+        placeholder="alpha,0x1234...,base\nbeta,0xabcd...,eth",
     )
-    moralis_api_key = st.text_input("Moralis API key", type="password")
+    default_api_key = st.secrets.get("MORALIS_API_KEY", "") if hasattr(st, "secrets") else ""
+    moralis_api_key = st.text_input("Moralis API key", value=default_api_key, type="password")
     hours_back = st.slider("Lookback window (hours)", 6, 168, DEFAULT_LOOKBACK_HOURS, 6)
-    limit = st.slider("Max transfers per wallet", 10, 100, DEFAULT_LIMIT, 10)
+    limit = st.slider("Max swaps per wallet", 10, 100, DEFAULT_LIMIT, 10)
     min_wallet_consensus = st.slider("Minimum wallets buying same token", 1, 5, 2, 1)
     hide_majors = st.checkbox("Hide majors / stablecoins", value=True)
     only_buys = st.checkbox("Only show BUY signals", value=True)
@@ -299,71 +278,84 @@ with st.sidebar:
 
 wallets = parse_wallets(wallets_text)
 
-if "last_loaded" not in st.session_state:
-    st.session_state.last_loaded = None
-if "signals_df" not in st.session_state:
-    st.session_state.signals_df = pd.DataFrame()
-
 if refresh:
     st.cache_data.clear()
 
 if not wallets:
-    st.info("Add at least one wallet in the sidebar to begin.")
+    st.info("Add at least one real wallet in the sidebar to begin.")
     st.stop()
 
 if not moralis_api_key:
-    st.warning("Add a Moralis API key to load live wallet transfer data.")
-    st.code("pip install streamlit pandas requests")
+    st.warning("Add a Moralis API key to load live wallet data.")
     st.stop()
 
+stats_rows: List[Dict[str, Any]] = []
 errors: List[str] = []
 all_rows: List[Dict[str, Any]] = []
 
 with st.spinner("Fetching wallet activity..."):
     for wallet in wallets:
+        stats = get_wallet_stats(wallet["address"], wallet["chain"], moralis_api_key)
+        stats_rows.append(
+            {
+                "wallet_label": wallet["label"],
+                "chain": wallet["chain"],
+                "address": wallet["address"],
+                "token_transfers_total": safe_get(stats, "token_transfers", "total", default=0),
+                "transactions_total": safe_get(stats, "transactions", "total", default=0),
+                "stats_error": stats.get("error", "") if isinstance(stats, dict) else "",
+            }
+        )
         try:
-            transfers = get_wallet_token_transfers(
+            swaps = get_wallet_swaps(
                 address=wallet["address"],
                 chain=wallet["chain"],
                 api_key=moralis_api_key,
                 hours_back=hours_back,
                 limit=limit,
             )
-            for item in transfers:
-                all_rows.append(normalize_transfer(item, wallet))
+            for item in swaps:
+                all_rows.append(normalize_swap(item, wallet))
         except Exception as exc:
             errors.append(f"{wallet['label']} ({wallet['chain']}): {exc}")
 
+stats_df = pd.DataFrame(stats_rows)
 signals_df = pd.DataFrame(all_rows)
 
-if not signals_df.empty:
-    signals_df["timestamp"] = pd.to_datetime(signals_df["timestamp"], errors="coerce", utc=True)
-    signals_df = signals_df.sort_values("timestamp", ascending=False)
-    if only_buys:
-        signals_df = signals_df[signals_df["action"] == "BUY"]
-    if hide_majors:
-        signals_df = signals_df[~signals_df["token_symbol"].isin(IGNORE_SYMBOLS)]
-    signals_df = enrich_signals(signals_df)
+st.subheader("Wallet diagnostics")
+if not stats_df.empty:
+    st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
-st.session_state.signals_df = signals_df
-st.session_state.last_loaded = now_utc()
+if errors:
+    with st.expander("API errors", expanded=True):
+        for err in errors:
+            st.error(err)
+
+if signals_df.empty:
+    st.warning(
+        "Moralis returned no swaps for these wallets in the current lookback window. "
+        "That usually means the wallet list is poor for swap tracking, not that the app is broken."
+    )
+    st.stop()
+
+signals_df["timestamp"] = pd.to_datetime(signals_df["timestamp"], errors="coerce", utc=True)
+signals_df = signals_df.sort_values("timestamp", ascending=False)
+
+if only_buys:
+    signals_df = signals_df[signals_df["action"] == "BUY"]
+if hide_majors:
+    signals_df = signals_df[~signals_df["token_symbol"].isin(IGNORE_SYMBOLS)]
+
+signals_df = enrich_signals(signals_df)
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Tracked wallets", len(wallets))
 col2.metric("Signals", len(signals_df))
 col3.metric("Unique tokens", int(signals_df["token_address"].nunique()) if not signals_df.empty else 0)
-col4.metric(
-    "Last refresh (UTC)",
-    st.session_state.last_loaded.strftime("%Y-%m-%d %H:%M:%S") if st.session_state.last_loaded else "-",
-)
-
-if errors:
-    with st.expander("Wallet/API errors", expanded=False):
-        for err in errors:
-            st.error(err)
+col4.metric("Last refresh (UTC)", now_utc().strftime("%Y-%m-%d %H:%M:%S"))
 
 if signals_df.empty:
-    st.info("No matching signals found for the current filters.")
+    st.info("Activity exists, but nothing passed the current filters. Turn off 'Hide majors / stablecoins' or 'Only show BUY signals'.")
     st.stop()
 
 consensus_df = build_consensus_table(signals_df)
@@ -401,9 +393,9 @@ else:
         hide_index=True,
     )
 
-st.subheader("Recent wallet activity")
+st.subheader("Recent wallet swaps")
 display = signals_df.copy()
-for col in ["amount", "priceUsd", "liquidityUsd", "fdv", "marketCap", "volume24h"]:
+for col in ["amount", "sold_amount", "bought_amount", "priceUsd", "liquidityUsd", "fdv", "marketCap", "volume24h"]:
     if col in display.columns:
         display[col] = display[col].apply(fmt_num)
 for col in ["priceChangeM5", "priceChangeH1", "priceChangeH6", "priceChangeH24"]:
@@ -413,50 +405,3 @@ for col in ["priceChangeM5", "priceChangeH1", "priceChangeH6", "priceChangeH24"]
 st.dataframe(
     display[
         [
-            "timestamp",
-            "wallet_label",
-            "chain",
-            "action",
-            "token_symbol",
-            "token_name",
-            "amount",
-            "priceUsd",
-            "liquidityUsd",
-            "volume24h",
-            "priceChangeH24",
-            "pairUrl",
-            "tx_hash",
-        ]
-    ],
-    use_container_width=True,
-    hide_index=True,
-)
-
-with st.expander("How to use this app"):
-    st.markdown(
-        """
-1. Add a Moralis API key in the sidebar.
-2. Add wallets in `label,address,chain` format.
-3. Click **Refresh**.
-4. Start with 5-10 wallets you believe are worth tracking.
-5. Watch the **Consensus buys** table first.
-
-Heuristic used here:
-- inbound ERC-20 transfer to tracked wallet = BUY
-- outbound ERC-20 transfer from tracked wallet = SELL
-
-This is intentionally simple and fast, but not perfect. Wallets can receive transfers for reasons other than buying, including transfers between owned wallets, airdrops, vesting, LP activity, or treasury moves.
-        """
-    )
-
-with st.expander("Next upgrades"):
-    st.markdown(
-        """
-- Telegram or Discord alerts for new consensus buys
-- Wallet scoring based on past performance
-- Exclude airdrops and suspicious low-liquidity tokens
-- Add Solana support through a separate data provider
-- Add paper-trading and alert backtesting
-- Save tracked wallets and settings to a database
-        """
-    )
