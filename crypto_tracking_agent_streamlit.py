@@ -7,27 +7,23 @@ import requests
 import streamlit as st
 
 APP_TITLE = "Crypto Tracking Agent"
-APP_SUBTITLE = "Two-panel scanner: on-chain whales + social narrative fusion"
-MORALIS_BASE = "https://deep-index.moralis.io/api/v2.2"
+APP_SUBTITLE = "Etherscan + DEX Screener architecture with on-chain, social, and entry intelligence"
+ETHERSCAN_BASE = "https://api.etherscan.io/v2/api"
 REQUEST_TIMEOUT = 20
 WALLETS_FILE = "wallets.txt"
 SUPPORTED_CHAINS = {
-    "eth": "Ethereum",
-    "bsc": "BNB Chain",
-    "polygon": "Polygon",
-    "base": "Base",
-    "arbitrum": "Arbitrum",
-    "optimism": "Optimism",
-    "avalanche": "Avalanche",
+    "eth": {"name": "Ethereum", "chainid": "1"},
+    "base": {"name": "Base", "chainid": "8453"},
+    "arbitrum": {"name": "Arbitrum", "chainid": "42161"},
+    "optimism": {"name": "Optimism", "chainid": "10"},
+    "polygon": {"name": "Polygon", "chainid": "137"},
 }
 DEXSCREENER_CHAIN_MAP = {
     "eth": "ethereum",
-    "bsc": "bsc",
-    "polygon": "polygon",
     "base": "base",
     "arbitrum": "arbitrum",
     "optimism": "optimism",
-    "avalanche": "avalanche",
+    "polygon": "polygon",
 }
 STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "FDUSD", "TUSD", "USDE", "USDC.E", "USDT.E"}
 IGNORE_SYMBOLS = STABLE_SYMBOLS.union({"WETH", "WBTC", "ETH", "BNB", "MATIC", "AVAX", "OP", "ARB"})
@@ -60,15 +56,6 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
-
-
-def safe_get(d: Dict[str, Any], *keys: str, default=None):
-    cur: Any = d
-    for key in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(key)
-    return cur if cur is not None else default
 
 
 def load_wallets_from_file() -> str:
@@ -138,44 +125,93 @@ def parse_social_watchlist(text: str) -> pd.DataFrame:
         influencers = int(float(parts[2])) if len(parts) >= 3 and parts[2] else 1
         sentiment = safe_float(parts[3], 0.0) if len(parts) >= 4 else 0.0
         note = parts[4] if len(parts) >= 5 else ""
-        rows.append({
-            "token_symbol": token_symbol,
-            "mentions": mentions,
-            "influencers": influencers,
-            "sentiment": sentiment,
-            "note": note,
-        })
+        rows.append(
+            {
+                "token_symbol": token_symbol,
+                "mentions": mentions,
+                "influencers": influencers,
+                "sentiment": sentiment,
+                "note": note,
+            }
+        )
     return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=120)
-def get_wallet_stats(address: str, chain: str, api_key: str) -> Dict[str, Any]:
-    url = f"{MORALIS_BASE}/wallets/{address}/stats"
-    resp = requests.get(url, headers={"X-API-Key": api_key}, params={"chain": chain}, timeout=REQUEST_TIMEOUT)
-    if resp.status_code != 200:
-        return {"error": f"{resp.status_code}: {resp.text[:120]}"}
-    return resp.json() or {}
-
-
-@st.cache_data(ttl=120)
-def get_wallet_swaps(address: str, chain: str, api_key: str, hours_back: int, limit: int) -> List[Dict[str, Any]]:
-    to_date = now_utc()
-    from_date = to_date - timedelta(hours=hours_back)
-    url = f"{MORALIS_BASE}/wallets/{address}/swaps"
+def get_wallet_token_transfers(address: str, chain: str, api_key: str, offset: int) -> Dict[str, Any]:
+    chainid = SUPPORTED_CHAINS[chain]["chainid"]
     params = {
-        "chain": chain,
-        "from_date": from_date.isoformat(),
-        "to_date": to_date.isoformat(),
-        "limit": max(1, min(limit, 100)),
-        "order": "DESC",
+        "chainid": chainid,
+        "module": "account",
+        "action": "tokentx",
+        "address": address,
+        "page": 1,
+        "offset": max(1, min(offset, 1000)),
+        "sort": "desc",
+        "apikey": api_key,
     }
-    resp = requests.get(url, headers={"X-API-Key": api_key}, params=params, timeout=REQUEST_TIMEOUT)
+    resp = requests.get(ETHERSCAN_BASE, params=params, timeout=REQUEST_TIMEOUT)
     if resp.status_code != 200:
-        raise RuntimeError(f"{resp.status_code}: {resp.text[:140]}")
+        return {"error": f"HTTP {resp.status_code}: {resp.text[:140]}"}
     data = resp.json() or {}
-    if isinstance(data, list):
-        return data
-    return data.get("result", []) or []
+    status = str(data.get("status", ""))
+    message = str(data.get("message", ""))
+    result = data.get("result", [])
+    if isinstance(result, str):
+        if result:
+            return {"error": result[:180], "raw": data}
+        return {"result": []}
+    if status == "0" and message not in {"No transactions found", "No records found"} and result:
+        return {"error": str(result)[:180], "raw": data}
+    return {"result": result or []}
+
+
+def normalize_transfer(item: Dict[str, Any], wallet_meta: Dict[str, str], lookback_hours: int) -> Dict[str, Any] | None:
+    ts_raw = item.get("timeStamp")
+    if not ts_raw:
+        return None
+    try:
+        ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+    except Exception:
+        return None
+    if ts < now_utc() - timedelta(hours=lookback_hours):
+        return None
+
+    wallet = wallet_meta["address"].lower()
+    from_addr = str(item.get("from") or "").lower()
+    to_addr = str(item.get("to") or "").lower()
+    symbol = str(item.get("tokenSymbol") or "").upper()
+    token_name = str(item.get("tokenName") or "")
+    token_address = str(item.get("contractAddress") or "").lower()
+    decimals = int(item.get("tokenDecimal") or 0)
+    raw_value = str(item.get("value") or "0")
+
+    try:
+        amount = int(raw_value) / (10 ** decimals) if decimals >= 0 else 0
+    except Exception:
+        amount = 0
+
+    if to_addr == wallet and from_addr != wallet:
+        action = "BUY"
+    elif from_addr == wallet and to_addr != wallet:
+        action = "SELL"
+    else:
+        action = "MOVE"
+
+    return {
+        "timestamp": ts,
+        "wallet_label": wallet_meta["label"],
+        "wallet_address": wallet_meta["address"],
+        "chain": wallet_meta["chain"],
+        "action": action,
+        "token_symbol": symbol,
+        "token_name": token_name,
+        "token_address": token_address,
+        "amount": amount,
+        "from_address": from_addr,
+        "to_address": to_addr,
+        "tx_hash": str(item.get("hash") or ""),
+    }
 
 
 @st.cache_data(ttl=180)
@@ -195,55 +231,17 @@ def get_token_market_snapshot(chain: str, token_address: str) -> Dict[str, Any]:
         return {}
 
     def rank_pair(pair: Dict[str, Any]) -> Tuple[float, float]:
-        return (
-            safe_float(safe_get(pair, "liquidity", "usd", default=0)),
-            safe_float(safe_get(pair, "volume", "h24", default=0)),
-        )
+        liquidity = safe_float(pair.get("liquidity", {}).get("usd") if isinstance(pair.get("liquidity"), dict) else 0)
+        volume = safe_float(pair.get("volume", {}).get("h24") if isinstance(pair.get("volume"), dict) else 0)
+        return liquidity, volume
 
     best = sorted(pairs, key=rank_pair, reverse=True)[0]
     return {
-        "priceUsd": safe_get(best, "priceUsd"),
-        "liquidityUsd": safe_get(best, "liquidity", "usd"),
-        "volume24h": safe_get(best, "volume", "h24"),
-        "priceChangeH24": safe_get(best, "priceChange", "h24"),
+        "priceUsd": best.get("priceUsd"),
+        "liquidityUsd": (best.get("liquidity") or {}).get("usd") if isinstance(best.get("liquidity"), dict) else None,
+        "volume24h": (best.get("volume") or {}).get("h24") if isinstance(best.get("volume"), dict) else None,
+        "priceChangeH24": (best.get("priceChange") or {}).get("h24") if isinstance(best.get("priceChange"), dict) else None,
         "pairUrl": best.get("url"),
-    }
-
-
-def normalize_swap(item: Dict[str, Any], wallet_meta: Dict[str, str]) -> Dict[str, Any]:
-    bought = item.get("bought") or {}
-    sold = item.get("sold") or {}
-    bought_symbol = str(bought.get("symbol") or "").upper()
-    sold_symbol = str(sold.get("symbol") or "").upper()
-    action = "BUY"
-    token_symbol = bought_symbol
-    token_name = str(bought.get("name") or "")
-    token_address = str(bought.get("address") or "").lower()
-    amount = bought.get("amount") or 0
-
-    if bought_symbol in STABLE_SYMBOLS and sold_symbol and sold_symbol not in STABLE_SYMBOLS:
-        action = "SELL"
-        token_symbol = sold_symbol
-        token_name = str(sold.get("name") or "")
-        token_address = str(sold.get("address") or "").lower()
-        amount = sold.get("amount") or 0
-
-    return {
-        "timestamp": item.get("blockTimestamp") or item.get("block_timestamp"),
-        "wallet_label": wallet_meta["label"],
-        "wallet_address": wallet_meta["address"],
-        "chain": wallet_meta["chain"],
-        "action": action,
-        "token_symbol": token_symbol,
-        "token_name": token_name,
-        "token_address": token_address,
-        "amount": amount,
-        "sold_symbol": sold_symbol,
-        "sold_amount": sold.get("amount") or 0,
-        "bought_symbol": bought_symbol,
-        "bought_amount": bought.get("amount") or 0,
-        "exchangeName": item.get("exchangeName") or item.get("exchange_name") or "",
-        "tx_hash": item.get("transactionHash") or item.get("transaction_hash") or "",
     }
 
 
@@ -251,8 +249,7 @@ def enrich_signals(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     snapshots: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    unique_pairs = set(zip(df["chain"], df["token_address"]))
-    for chain, token_address in unique_pairs:
+    for chain, token_address in set(zip(df["chain"], df["token_address"])):
         snapshots[(chain, token_address)] = get_token_market_snapshot(chain, token_address)
     for key in ["priceUsd", "liquidityUsd", "volume24h", "priceChangeH24", "pairUrl"]:
         df[key] = df.apply(lambda r: snapshots.get((r["chain"], r["token_address"]), {}).get(key), axis=1)
@@ -279,17 +276,19 @@ def build_wallet_profiles(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for wallet_label, wallet_df in df.groupby("wallet_label"):
-        rows.append({
-            "wallet_label": wallet_label,
-            "chain": wallet_df["chain"].iloc[0],
-            "events": len(wallet_df),
-            "unique_tokens": wallet_df["token_symbol"].nunique(),
-            "buy_events": int((wallet_df["action"] == "BUY").sum()),
-            "sell_events": int((wallet_df["action"] == "SELL").sum()),
-            "largest_buy_amount": pd.to_numeric(wallet_df.loc[wallet_df["action"] == "BUY", "amount"], errors="coerce").max(),
-            "style": classify_wallet_style(wallet_df),
-            "last_seen": wallet_df["timestamp"].max(),
-        })
+        rows.append(
+            {
+                "wallet_label": wallet_label,
+                "chain": wallet_df["chain"].iloc[0],
+                "events": len(wallet_df),
+                "unique_tokens": wallet_df["token_symbol"].nunique(),
+                "buy_events": int((wallet_df["action"] == "BUY").sum()),
+                "sell_events": int((wallet_df["action"] == "SELL").sum()),
+                "largest_buy_amount": pd.to_numeric(wallet_df.loc[wallet_df["action"] == "BUY", "amount"], errors="coerce").max(),
+                "style": classify_wallet_style(wallet_df),
+                "last_seen": wallet_df["timestamp"].max(),
+            }
+        )
     return pd.DataFrame(rows).sort_values(["events", "buy_events"], ascending=False)
 
 
@@ -367,6 +366,7 @@ def classify_risk(liquidity: float, wallet_count: int) -> str:
 
 def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame) -> pd.DataFrame:
     buys = df[df["action"] == "BUY"].copy()
+    buys = buys[~buys["token_symbol"].isin(STABLE_SYMBOLS)]
     if buys.empty:
         return pd.DataFrame()
     style_lookup = dict(zip(wallet_profiles["wallet_label"], wallet_profiles["style"])) if not wallet_profiles.empty else {}
@@ -398,7 +398,10 @@ def build_social_panel(social_df: pd.DataFrame) -> pd.DataFrame:
     if social_df.empty:
         return pd.DataFrame()
     out = social_df.copy()
-    out["social_score"] = out.apply(lambda r: min(100, int(r["mentions"]) * 2 + int(r["influencers"]) * 6 + (20 if safe_float(r["sentiment"]) > 0.6 else 10 if safe_float(r["sentiment"]) > 0.2 else -10 if safe_float(r["sentiment"]) < -0.2 else 0)), axis=1)
+    out["social_score"] = out.apply(
+        lambda r: min(100, int(r["mentions"]) * 2 + int(r["influencers"]) * 6 + (20 if safe_float(r["sentiment"]) > 0.6 else 10 if safe_float(r["sentiment"]) > 0.2 else -10 if safe_float(r["sentiment"]) < -0.2 else 0)),
+        axis=1,
+    )
     out["social_score"] = out["social_score"].clip(lower=0)
     return out.sort_values(["social_score", "mentions", "influencers"], ascending=False)
 
@@ -483,12 +486,12 @@ with st.sidebar:
             st.rerun()
 
     try:
-        default_moralis_key = st.secrets.get("MORALIS_API_KEY", "")
+        default_etherscan_key = st.secrets.get("ETHERSCAN_API_KEY", "")
     except Exception:
-        default_moralis_key = os.getenv("MORALIS_API_KEY", "")
-    moralis_api_key = st.text_input("Moralis API key", value=default_moralis_key, type="password")
-    hours_back = st.slider("Lookback window (hours)", 6, 168, 72, 6)
-    limit = st.slider("Max swaps per wallet", 10, 100, 50, 10)
+        default_etherscan_key = os.getenv("ETHERSCAN_API_KEY", "")
+    etherscan_api_key = st.text_input("Etherscan API key", value=default_etherscan_key, type="password")
+    hours_back = st.slider("Lookback window (hours)", 6, 168, 48, 6)
+    limit = st.slider("Max transfers per wallet", 20, 300, 100, 20)
     min_wallet_consensus = st.slider("Minimum wallets buying same token", 1, 5, 1, 1)
     hide_majors = st.checkbox("Hide majors / stablecoins", value=False)
     only_buys = st.checkbox("Only show BUY signals", value=False)
@@ -509,31 +512,50 @@ wallets = parse_wallets(st.session_state.wallets_text)
 if not wallets:
     st.info("Add at least one valid wallet in label,address,chain format.")
     st.stop()
-if not moralis_api_key:
-    st.warning("Add your Moralis API key to continue.")
+if not etherscan_api_key:
+    st.warning("Add your Etherscan API key to continue.")
     st.stop()
 
 stats_rows: List[Dict[str, Any]] = []
 errors: List[str] = []
 all_rows: List[Dict[str, Any]] = []
+quota_hit = False
 
 with st.spinner("Fetching wallet activity..."):
     for wallet in wallets:
-        stats = get_wallet_stats(wallet["address"], wallet["chain"], moralis_api_key)
-        stats_rows.append({
-            "wallet_label": wallet["label"],
-            "chain": wallet["chain"],
-            "address": wallet["address"],
-            "token_transfers_total": safe_get(stats, "token_transfers", "total", default=0),
-            "transactions_total": safe_get(stats, "transactions", "total", default=0),
-            "stats_error": stats.get("error", "") if isinstance(stats, dict) else "",
-        })
-        try:
-            swaps = get_wallet_swaps(wallet["address"], wallet["chain"], moralis_api_key, hours_back, limit)
-            for item in swaps:
-                all_rows.append(normalize_swap(item, wallet))
-        except Exception as exc:
-            errors.append(f"{wallet['label']} ({wallet['chain']}): {exc}")
+        if quota_hit:
+            break
+        payload = get_wallet_token_transfers(wallet["address"], wallet["chain"], etherscan_api_key, limit)
+        if payload.get("error"):
+            msg = str(payload.get("error"))
+            errors.append(f"{wallet['label']} ({wallet['chain']}): {msg}")
+            if "rate limit" in msg.lower() or "max rate" in msg.lower() or "NOTOK" in msg:
+                quota_hit = True
+            stats_rows.append(
+                {
+                    "wallet_label": wallet["label"],
+                    "chain": wallet["chain"],
+                    "address": wallet["address"],
+                    "transfers_fetched": 0,
+                    "status": "error",
+                }
+            )
+            continue
+
+        transfers = payload.get("result", [])
+        stats_rows.append(
+            {
+                "wallet_label": wallet["label"],
+                "chain": wallet["chain"],
+                "address": wallet["address"],
+                "transfers_fetched": len(transfers),
+                "status": "ok",
+            }
+        )
+        for item in transfers:
+            normalized = normalize_transfer(item, wallet, hours_back)
+            if normalized is not None:
+                all_rows.append(normalized)
 
 stats_df = pd.DataFrame(stats_rows)
 raw_df = pd.DataFrame(all_rows)
@@ -545,8 +567,11 @@ if not stats_df.empty:
 if errors:
     for err in errors:
         st.error(err)
+if quota_hit and raw_df.empty:
+    st.warning("The provider appears rate-limited or quota-limited right now. Try again later or reduce refresh frequency.")
+    st.stop()
 if raw_df.empty:
-    st.warning("No swaps were returned for the current wallets and time window.")
+    st.warning("No token transfer activity was returned for the current wallets and time window.")
     st.stop()
 
 raw_df["timestamp"] = pd.to_datetime(raw_df["timestamp"], errors="coerce", utc=True)
@@ -635,9 +660,9 @@ else:
         f"Wallets: {selected_row.get('wallets', '') or 'none'}. Social note: {selected_row.get('note', '') or 'none'}."
     )
 
-st.subheader("Recent wallet swaps")
+st.subheader("Recent token transfer activity")
 display = signals_df.copy()
-for col in ["amount", "sold_amount", "bought_amount", "priceUsd", "liquidityUsd", "volume24h"]:
+for col in ["amount", "priceUsd", "liquidityUsd", "volume24h"]:
     if col in display.columns:
         display[col] = display[col].apply(fmt_num)
 if "priceChangeH24" in display.columns:
@@ -645,24 +670,19 @@ if "priceChangeH24" in display.columns:
 
 st.dataframe(display[[
     "timestamp", "wallet_label", "chain", "action", "token_symbol", "token_name", "amount",
-    "sold_symbol", "sold_amount", "bought_symbol", "bought_amount", "exchangeName", "priceUsd",
-    "liquidityUsd", "volume24h", "priceChangeH24", "pairUrl", "tx_hash"
+    "priceUsd", "liquidityUsd", "volume24h", "priceChangeH24", "pairUrl", "tx_hash"
 ]], use_container_width=True, hide_index=True)
 
 with st.expander("Notes"):
     st.markdown(
         """
-This version includes entry intelligence.
+This version implements the new architecture:
+- Etherscan V2 for wallet token transfers
+- DEX Screener for market enrichment
+- manual social watchlist input
+- fusion scoring
+- entry intelligence
 
-New fields:
-- `setup_type`
-- `entry_signal`
-- `risk_level`
-
-Interpretation:
-- Early Accumulation = stalk entry / small starter
-- Momentum Ignition = enter on continuation
-- Extended = wait for pullback
-- Single-Wallet Accumulation = wait for second wallet confirmation
+Use an `ETHERSCAN_API_KEY` secret in Streamlit for the cleanest setup.
         """
     )
