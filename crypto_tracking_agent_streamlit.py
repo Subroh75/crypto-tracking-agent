@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 APP_TITLE = "Crypto Tracking Agent"
-APP_SUBTITLE = "Etherscan + DEX Screener architecture with on-chain, social, and entry intelligence"
+APP_SUBTITLE = "Etherscan + DEX Screener architecture with on-chain, social, entry intelligence, and wallet discovery"
 ETHERSCAN_BASE = "https://api.etherscan.io/v2/api"
 REQUEST_TIMEOUT = 20
 WALLETS_FILE = "wallets.txt"
@@ -125,15 +125,13 @@ def parse_social_watchlist(text: str) -> pd.DataFrame:
         influencers = int(float(parts[2])) if len(parts) >= 3 and parts[2] else 1
         sentiment = safe_float(parts[3], 0.0) if len(parts) >= 4 else 0.0
         note = parts[4] if len(parts) >= 5 else ""
-        rows.append(
-            {
-                "token_symbol": token_symbol,
-                "mentions": mentions,
-                "influencers": influencers,
-                "sentiment": sentiment,
-                "note": note,
-            }
-        )
+        rows.append({
+            "token_symbol": token_symbol,
+            "mentions": mentions,
+            "influencers": influencers,
+            "sentiment": sentiment,
+            "note": note,
+        })
     return pd.DataFrame(rows)
 
 
@@ -300,20 +298,18 @@ def build_wallet_profiles(df: pd.DataFrame) -> pd.DataFrame:
             wallet_score -= 15
         wallet_score = max(0, min(wallet_score, 100))
 
-        rows.append(
-            {
-                "wallet_label": wallet_label,
-                "chain": wallet_df["chain"].iloc[0],
-                "events": events,
-                "unique_tokens": unique_tokens,
-                "buy_events": buy_events,
-                "sell_events": sell_events,
-                "largest_buy_amount": pd.to_numeric(wallet_df.loc[wallet_df["action"] == "BUY", "amount"], errors="coerce").max(),
-                "style": classify_wallet_style(wallet_df),
-                "wallet_score": wallet_score,
-                "last_seen": wallet_df["timestamp"].max(),
-            }
-        )
+        rows.append({
+            "wallet_label": wallet_label,
+            "chain": wallet_df["chain"].iloc[0],
+            "events": events,
+            "unique_tokens": unique_tokens,
+            "buy_events": buy_events,
+            "sell_events": sell_events,
+            "largest_buy_amount": pd.to_numeric(wallet_df.loc[wallet_df["action"] == "BUY", "amount"], errors="coerce").max(),
+            "style": classify_wallet_style(wallet_df),
+            "wallet_score": wallet_score,
+            "last_seen": wallet_df["timestamp"].max(),
+        })
     return pd.DataFrame(rows).sort_values(["wallet_score", "events", "buy_events"], ascending=False)
 
 
@@ -321,7 +317,6 @@ def score_signal(wallet_count: int, buy_events: int, liquidity: float, volume_24
     score = 0
     score += min(int(wallet_score_sum / 2), 40)
     score += min(buy_events * 4, 20)
-
     if wallet_count >= 2:
         score += 10
     elif wallet_count == 1:
@@ -445,30 +440,8 @@ def build_consensus_table(df: pd.DataFrame, wallet_profiles: pd.DataFrame, min_l
     if grouped.empty:
         return grouped
 
-    grouped["signal_score"] = grouped.apply(
-        lambda r: score_signal(
-            int(r["wallet_count"]),
-            int(r["buy_events"]),
-            safe_float(r["liquidity_usd"]),
-            safe_float(r["volume_24h"]),
-            safe_float(r["price_change_h24"]),
-            safe_float(r["recency_hours"], 999.0),
-            safe_float(r["wallet_score_sum"]),
-        )[0],
-        axis=1,
-    )
-    grouped["signal_label"] = grouped.apply(
-        lambda r: score_signal(
-            int(r["wallet_count"]),
-            int(r["buy_events"]),
-            safe_float(r["liquidity_usd"]),
-            safe_float(r["volume_24h"]),
-            safe_float(r["price_change_h24"]),
-            safe_float(r["recency_hours"], 999.0),
-            safe_float(r["wallet_score_sum"]),
-        )[1],
-        axis=1,
-    )
+    grouped["signal_score"] = grouped.apply(lambda r: score_signal(int(r["wallet_count"]), int(r["buy_events"]), safe_float(r["liquidity_usd"]), safe_float(r["volume_24h"]), safe_float(r["price_change_h24"]), safe_float(r["recency_hours"], 999.0), safe_float(r["wallet_score_sum"]))[0], axis=1)
+    grouped["signal_label"] = grouped.apply(lambda r: score_signal(int(r["wallet_count"]), int(r["buy_events"]), safe_float(r["liquidity_usd"]), safe_float(r["volume_24h"]), safe_float(r["price_change_h24"]), safe_float(r["recency_hours"], 999.0), safe_float(r["wallet_score_sum"]))[1], axis=1)
     grouped["setup_type"] = grouped.apply(lambda r: classify_setup(safe_float(r["price_change_h24"]), int(r["wallet_count"]), int(r["buy_events"])), axis=1)
     grouped["entry_signal"] = grouped["setup_type"].apply(classify_entry_signal)
     grouped["risk_level"] = grouped.apply(lambda r: classify_risk(safe_float(r["liquidity_usd"]), int(r["wallet_count"])), axis=1)
@@ -479,10 +452,7 @@ def build_social_panel(social_df: pd.DataFrame) -> pd.DataFrame:
     if social_df.empty:
         return pd.DataFrame()
     out = social_df.copy()
-    out["social_score"] = out.apply(
-        lambda r: min(100, int(r["mentions"]) * 2 + int(r["influencers"]) * 6 + (20 if safe_float(r["sentiment"]) > 0.6 else 10 if safe_float(r["sentiment"]) > 0.2 else -10 if safe_float(r["sentiment"]) < -0.2 else 0)),
-        axis=1,
-    )
+    out["social_score"] = out.apply(lambda r: min(100, int(r["mentions"]) * 2 + int(r["influencers"]) * 6 + (20 if safe_float(r["sentiment"]) > 0.6 else 10 if safe_float(r["sentiment"]) > 0.2 else -10 if safe_float(r["sentiment"]) < -0.2 else 0)), axis=1)
     out["social_score"] = out["social_score"].clip(lower=0)
     return out.sort_values(["social_score", "mentions", "influencers"], ascending=False)
 
@@ -543,6 +513,99 @@ def build_fusion_panel(consensus_df: pd.DataFrame, social_df: pd.DataFrame) -> p
 
     merged["fusion_label"] = merged.apply(label_row, axis=1)
     return merged.sort_values(["fusion_score", "signal_score", "social_score"], ascending=False)
+
+
+def build_wallet_discovery_engine(wallet_profiles_df: pd.DataFrame, consensus_df: pd.DataFrame) -> pd.DataFrame:
+    if wallet_profiles_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    wallet_signal_map: Dict[str, List[Dict[str, Any]]] = {}
+
+    if not consensus_df.empty:
+        for _, row in consensus_df.iterrows():
+            wallets = [w.strip() for w in row.get("wallets", "").split(",") if w.strip()]
+            for wallet in wallets:
+                wallet_signal_map.setdefault(wallet, []).append({
+                    "signal_score": safe_float(row.get("signal_score"), 0.0),
+                    "setup_type": row.get("setup_type", ""),
+                    "token_symbol": row.get("token_symbol", ""),
+                })
+
+    for _, wallet_row in wallet_profiles_df.iterrows():
+        label = wallet_row["wallet_label"]
+        signal_hits = wallet_signal_map.get(label, [])
+        signal_count = len(signal_hits)
+        avg_signal_score = sum(hit["signal_score"] for hit in signal_hits) / signal_count if signal_count else 0.0
+        early_hits = sum(1 for hit in signal_hits if hit["setup_type"] in {"Early Accumulation", "Momentum Ignition"})
+        wallet_score = safe_float(wallet_row.get("wallet_score"), 0.0)
+        unique_tokens = int(wallet_row.get("unique_tokens", 0) or 0)
+        events = int(wallet_row.get("events", 0) or 0)
+        buy_events = int(wallet_row.get("buy_events", 0) or 0)
+        noise_ratio = unique_tokens / events if events else 0.0
+
+        discovery_score = wallet_score
+        discovery_score += min(signal_count * 10, 30)
+        discovery_score += min(int(avg_signal_score / 5), 20)
+        discovery_score += min(early_hits * 8, 24)
+        if noise_ratio <= 0.35:
+            discovery_score += 10
+        elif noise_ratio >= 0.75:
+            discovery_score -= 10
+        if buy_events >= 5:
+            discovery_score += 6
+        discovery_score = max(0, min(int(discovery_score), 100))
+
+        if discovery_score >= 75:
+            recommendation = "KEEP"
+            action_note = "Core wallet. High priority for ongoing tracking."
+        elif discovery_score >= 55:
+            recommendation = "REVIEW"
+            action_note = "Monitor for another 2-3 sessions before deciding."
+        else:
+            recommendation = "REMOVE"
+            action_note = "Low edge or noisy behavior. Replace when better wallets appear."
+
+        rows.append({
+            "wallet_label": label,
+            "chain": wallet_row.get("chain", ""),
+            "wallet_score": int(wallet_score),
+            "signal_hits": signal_count,
+            "avg_signal_score": round(avg_signal_score, 1),
+            "early_hits": early_hits,
+            "noise_ratio": round(noise_ratio, 2),
+            "discovery_score": discovery_score,
+            "recommendation": recommendation,
+            "action_note": action_note,
+            "style": wallet_row.get("style", ""),
+            "events": events,
+            "buy_events": buy_events,
+            "unique_tokens": unique_tokens,
+        })
+
+    out = pd.DataFrame(rows).sort_values(["discovery_score", "signal_hits", "wallet_score"], ascending=False)
+    return out
+
+
+def build_hunt_list(consensus_df: pd.DataFrame) -> pd.DataFrame:
+    if consensus_df.empty:
+        return pd.DataFrame()
+    out = consensus_df.copy()
+    out = out[[
+        "token_symbol",
+        "chain",
+        "signal_score",
+        "signal_label",
+        "setup_type",
+        "wallet_count",
+        "buy_events",
+        "pair_url",
+    ]].copy()
+    out["hunt_note"] = out.apply(
+        lambda r: "Inspect early buyers on the chart / explorer and promote wallets that appear across strong setups.",
+        axis=1,
+    )
+    return out.sort_values(["signal_score", "wallet_count", "buy_events"], ascending=False).head(10)
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -675,6 +738,8 @@ consensus_df = build_consensus_table(signals_df, wallet_profiles_df, float(min_l
 if not consensus_df.empty:
     consensus_df = consensus_df[consensus_df["wallet_count"] >= min_wallet_consensus]
 fusion_df = build_fusion_panel(consensus_df, social_df)
+wallet_discovery_df = build_wallet_discovery_engine(wallet_profiles_df, consensus_df)
+hunt_list_df = build_hunt_list(consensus_df)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Tracked wallets", len(wallets))
@@ -689,6 +754,33 @@ else:
     display_profiles = wallet_profiles_df.copy()
     display_profiles["largest_buy_amount"] = display_profiles["largest_buy_amount"].apply(fmt_num)
     st.dataframe(display_profiles, use_container_width=True, hide_index=True)
+
+st.subheader("Wallet discovery engine")
+if wallet_discovery_df.empty:
+    st.info("Not enough data to score wallet quality yet.")
+else:
+    st.dataframe(wallet_discovery_df, use_container_width=True, hide_index=True)
+    keep_df = wallet_discovery_df[wallet_discovery_df["recommendation"] == "KEEP"]
+    remove_df = wallet_discovery_df[wallet_discovery_df["recommendation"] == "REMOVE"]
+
+    col_keep, col_remove = st.columns(2)
+    with col_keep:
+        st.markdown("**Keep / prioritize**")
+        if keep_df.empty:
+            st.write("No clear keep candidates yet.")
+        else:
+            st.write(", ".join(keep_df["wallet_label"].tolist()))
+    with col_remove:
+        st.markdown("**Review / remove first**")
+        if remove_df.empty:
+            st.write("No clear remove candidates yet.")
+        else:
+            st.write(", ".join(remove_df["wallet_label"].tolist()))
+
+if not hunt_list_df.empty:
+    st.subheader("Wallet hunt list")
+    st.dataframe(hunt_list_df, use_container_width=True, hide_index=True)
+    st.caption("Use the pair links on these strongest tokens to inspect early buyers and promote new wallets into your tracker.")
 
 left_col, right_col = st.columns(2)
 with left_col:
@@ -765,16 +857,16 @@ st.dataframe(display[[
 with st.expander("Notes"):
     st.markdown(
         """
-This version adds sharper signal quality logic:
-- quality filters for liquidity, volume, and buy count
-- wallet scoring
-- recency boost
-- improved setup and entry classification
+This version adds a wallet discovery engine.
 
-Recommended defaults:
-- min wallets: 2
-- min liquidity: 100,000
-- min volume: 50,000
-- min buy events: 2
+What it does:
+- scores tracked wallets as KEEP / REVIEW / REMOVE
+- measures wallet signal participation and early-hit behavior
+- creates a wallet hunt list from your strongest current token signals
+
+Recommended workflow:
+1. Use KEEP wallets as your core set.
+2. Remove the weakest wallets over time.
+3. Use the Wallet hunt list to inspect early buyers on your best token setups and add new wallets manually.
         """
     )
